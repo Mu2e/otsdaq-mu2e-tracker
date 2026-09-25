@@ -72,6 +72,7 @@ find_package(artdaq-core       3.09.16 REQUIRED EXPORT)
 find_package(artdaq-core-demo  1.11.00 REQUIRED EXPORT)
 find_package(otsdaq-mu2e       8.00.00 REQUIRED EXPORT)
 find_package(mu2e-pcie-utils   3.02.00 REQUIRED EXPORT)
+find_package(nlohmann_json             REQUIRED EXPORT)
 # find_package(ROOT              6.32.08 REQUIRED EXPORT)
 
 # message("---------- otsdaq-mu2e-tracker: PRINT CMAKE VARIABLES " )

@@ -18,6 +18,7 @@ cet_make_library(
         cetlib_except::cetlib_except
         mu2e-pcie-utils::CFOInterface
         mu2e-pcie-utils::DTCInterface
+        nlohmann_json::nlohmann_json
         ROOT::Core
         )
 
