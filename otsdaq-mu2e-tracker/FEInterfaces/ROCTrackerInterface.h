@@ -87,7 +87,7 @@ public:
 	// from DtcInterface.h :  ------------------
 	int          fEnabled = 1;   // if comes from ODB, could be 0
 	int          fPcieAddr = 0;  //
-	int          fLinkMask = 0;  // int is OK, bit 31 is never used for arithmetics
+	int          fLinkMask = -1;  // int is OK, bit 31 is never used for arithmetics
 	                         // for now assume that all ROCs are doing the same
 	                         // fRocReadoutMode: (fixed_length << 4) | readout_mode
 	int fRocReadoutMode = 0;     // 0: 'counter patterns' 1:digis 2:checkerboard patterns
