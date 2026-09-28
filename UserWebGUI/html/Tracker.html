@@ -235,7 +235,7 @@
 			if (!result || result.error) return false;
 			if (macroName === "ROC FEMacro - Find and serialize thresholds")
 				return Mu2eHardware.thresholdScanSucceeded(result);
-			if (macroName === "Get DTC Counters")
+			if (macroName === "ROC FEMacro - Get DTC Counter Values")
 				return counterLinks ? Mu2eHardware.checkDTCCounters(result, counterLinks).success :
 					Mu2eHardware.parseDTCCounters(result).errors.length === 0;
 			if (/Get Link Lock Status$/i.test(macroName || ""))
@@ -540,7 +540,7 @@
 
 		var GLOBAL_ACTIONS = {
 			"counters": {
-				label: "Counters", macro: "Get DTC Counters", inputs: {}, counters: true
+				label: "Counters", macro: "ROC FEMacro - Get DTC Counter Values", inputs: {}, counters: true
 			},
 			"status": {
 				label: "Status", status: true
@@ -960,6 +960,7 @@
 			Mu2eHardware.runMacroOnUIDs(_globalTargets, action.macro,
 				function (uid) {
 					if (action.thresholdScan) return thresholdInputs[uid];
+					if (action.counters) return Mu2eHardware.getDTCCounterInputs(uid, _globalCounterLinks[uid]);
 					var inputs = action.inputs || {};
 					if (action.allROCs) {
 						inputs = Mu2eHardware.getAllROCInputs(uid, action.macro);

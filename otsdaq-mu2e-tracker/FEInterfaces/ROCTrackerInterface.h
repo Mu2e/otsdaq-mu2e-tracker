@@ -64,6 +64,7 @@ public:
 	void InitReadout(__ARGS__);
 	void ReadRegister(__ARGS__);
 	void ResetCounters(__ARGS__);
+	void GetDTCCounterValues(__ARGS__);
 	void FindAlignment(__ARGS__);
 	void SetThreshold(__ARGS__);
 	void MeasureThreshold(__ARGS__);

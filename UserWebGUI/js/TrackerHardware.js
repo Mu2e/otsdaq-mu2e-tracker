@@ -2107,10 +2107,27 @@ var Mu2eHardware = Mu2eHardware || {};
 		return html;
 	};
 
-	// Get DTC Counters emits these decimal CSV rows in ROC-link order 0..5.
+	// Get DTC Counter Values returns numeric fields indexed by explicit ROC link ID.
 	var TRACKER_COUNTER_ROWS = [
 		"TX EWM Count", "TX Data Request Count", "TX Heartbeat Count", "RX Data Header Count"
 	];
+	var TRACKER_COUNTER_FIELDS = ["txEwm", "txDataRequest", "txHeartbeat", "rxDataHeader"];
+
+	// Route exactly once through an enabled tracker ROC plugin on this DTC.
+	// Its handler reads the parent DTC, including all six link counters.
+	Mu2eHardware.getDTCCounterInputs = function (uid, enabledLinks) {
+		var name = "ROC FEMacro - Get DTC Counter Values";
+		var macro = (Mu2eHardware.getMacrosForDevice(uid) || {})[name];
+		if (!macro || !Array.isArray(macro.inputs) || macro.inputs.length !== 1 ||
+			!Array.isArray(macro.outputs) || macro.outputs.indexOf("Counter Values") < 0 ||
+			!/^Target ROC(?: or Mask)?(?: \(.*\))?$/.test(macro.inputs[0])) return null;
+		if (!Array.isArray(enabledLinks) || enabledLinks.length !== 6) return null;
+		var link = enabledLinks.indexOf(true);
+		if (link < 0) return null;
+		var inputs = {};
+		inputs[macro.inputs[0]] = String(link);
+		return inputs;
+	};
 
 	Mu2eHardware.parseDTCCounters = function (result) {
 		var parsed = {rows: {}, errors: []};
@@ -2118,35 +2135,46 @@ var Mu2eHardware = Mu2eHardware || {};
 			parsed.errors.push(result && result.error ? String(result.error) : "No response received");
 			return parsed;
 		}
-		var reports = [];
-		(result.targets || []).forEach(function (target) {
-			var outputs = target.outputs || {};
-			Object.keys(outputs).forEach(function (key) {
-				if (_decodeURIComponentSafe(key) === "Performance Counters") reports.push(outputs[key]);
-			});
-		});
-		if (reports.length !== 1 || typeof reports[0] !== "string") {
-			parsed.errors.push("Missing or ambiguous Performance Counters output");
+		if (!Array.isArray(result.targets) || result.targets.length !== 1) {
+			parsed.errors.push("Expected counter values from exactly one DTC");
 			return parsed;
 		}
-		var matches = {};
-		reports[0].split(/\r?\n/).forEach(function (line) {
-			var separator = line.indexOf(":");
-			if (separator < 0) return;
-			var label = line.slice(0, separator).trim().replace(/\s+/g, " ");
-			if (TRACKER_COUNTER_ROWS.indexOf(label) < 0) return;
-			if (!matches[label]) matches[label] = [];
-			matches[label].push(line.slice(separator + 1).split(",").map(function (v) { return v.trim(); }));
-		});
-		TRACKER_COUNTER_ROWS.forEach(function (label) {
-			var rows = matches[label] || [];
-			if (rows.length !== 1 || rows[0].length !== 6 || !rows[0].every(function (v) {
-				return /^\d+$/.test(v) && Number(v) <= 0xFFFFFFFF;
-			})) {
-				parsed.errors.push(label + ": expected one row of six unsigned counter values");
-				return;
+		var outputs = result.targets[0] && result.targets[0].outputs;
+		if (!outputs || typeof outputs["Counter Values"] !== "string") {
+			parsed.errors.push("Missing Counter Values output; the DTC frontend must provide ROC FEMacro - Get DTC Counter Values");
+			return parsed;
+		}
+		var values;
+		try {
+			values = JSON.parse(outputs["Counter Values"]);
+		} catch (e) {
+			parsed.errors.push("Invalid Counter Values JSON");
+			return parsed;
+		}
+		if (!values || values.schemaVersion !== 1 || !Array.isArray(values.links) || values.links.length !== 6) {
+			parsed.errors.push("Expected Counter Values schema version 1 with six ROC links");
+			return parsed;
+		}
+		var byLink = Object.create(null);
+		for (var i = 0; i < values.links.length; ++i) {
+			var item = values.links[i];
+			if (!item || !Number.isInteger(item.link) || item.link < 0 || item.link > 5 || byLink[item.link]) {
+				parsed.errors.push("Expected unique ROC link IDs 0-5 in Counter Values");
+				return parsed;
 			}
-			parsed.rows[label] = rows[0];
+			byLink[item.link] = item;
+		}
+		TRACKER_COUNTER_ROWS.forEach(function (label, row) {
+			var field = TRACKER_COUNTER_FIELDS[row], counts = [];
+			for (var link = 0; link < 6; ++link) {
+				var count = byLink[link][field];
+				if (!Number.isInteger(count) || count < 0 || count > 0xFFFFFFFF) {
+					parsed.errors.push(label + ": ROC " + link + " must be an unsigned 32-bit integer");
+					return;
+				}
+				counts.push(count);
+			}
+			parsed.rows[label] = counts;
 		});
 		return parsed;
 	};
@@ -2249,7 +2277,7 @@ var Mu2eHardware = Mu2eHardware || {};
 					var uid = group.dtcs[Math.floor(col / 6)], parsed = uid && byUID[uid];
 					var values = parsed && parsed.rows[label];
 					var value = values ? values[col % 6] : uid && !parsed && !complete ? "Pending" : "N/A";
-					html += "<td" + columnAttributes(col) + ">" + _esc(value) + "</td>";
+					html += "<td" + columnAttributes(col) + ">" + _esc(String(value)) + "</td>";
 				}
 				html += "</tr>";
 			});
