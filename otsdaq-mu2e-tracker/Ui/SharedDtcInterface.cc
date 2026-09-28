@@ -1,5 +1,5 @@
 // Ed Callaghan
-// Wrap the precious heart in a mutexed singleton to keep it safe
+// Shared DTC ownership; callers must execute hardware operations sequentially
 // March 2026
 
 #include "otsdaq-mu2e-tracker/Ui/SharedDtcInterface.hh"
@@ -15,23 +15,19 @@ namespace trkdaq{
 
 	// initialize store of preconstructed instances
 	std::map< void*, std::shared_ptr<SharedDtcInterface> > SharedDtcInterface::instances;
-	std::mutex SharedDtcInterface::_get_mutex;
 
 	std::shared_ptr<SharedDtcInterface>& SharedDtcInterface::Get(DTCLib::DTC* dtc){
 		auto& instances = SharedDtcInterface::instances;
 		void* address = static_cast<void*>(dtc);
-		_get_mutex.lock();
 		if (instances.count(address) < 1){
 			instances[address] = std::make_shared<SharedDtcInterface>(dtc);
 		}
-		_get_mutex.unlock();
 		auto& rv = instances[address];
 		return rv;
 	}
 
 	bool SharedDtcInterface::PostInitialize(const trkdaq::DtcInterface::DtcConfiguration_t& config){
 		bool rv = false;
-		std::lock_guard lock(_mutex);
 		if (!_initialized){
 			_interface->PostInitialize(config);
 			_initialized = true;

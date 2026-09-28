@@ -29,6 +29,7 @@
 #include "otsdaq-mu2e-tracker/Ui/ProgramRoc.hh"
 
 #include "otsdaq-mu2e-tracker/Ui/BisectionSearch.hh"
+#include "otsdaq-mu2e-tracker/Ui/ThresholdSearch.hh"
 
 namespace trkdaq {
   using roc_serial_t = std::string;
@@ -224,7 +225,8 @@ namespace trkdaq {
                                const int           PreampType  ,
                                const float         threshold_mv,
                                const float         tolerance_mv,
-                               DTCLib::roc_data_t& out         );
+                               DTCLib::roc_data_t& out,
+                               ThresholdSearchResult* result = nullptr);
 
     bool         FindThreshold(const int   Link,
                                const int   ChannelID,
@@ -232,12 +234,15 @@ namespace trkdaq {
                                const float threshold_mv,
                                const float tolerance_mv);
 
+    float        QueryThreshold(int Link, int ChannelID, int PreampType);
+
     float        ProgramAndQueryThreshold(const int Link,
                                           const int ChannelID,
                                           const int PreampType,
                                           const DTCLib::roc_data_t dac);
 
 		uint16_t ReadROCRegister(int link, uint16_t address);
+		void WriteROCRegister(int link, uint16_t address, uint16_t data);
 
     virtual std::vector<std::string> GetRocRegistersNames     (bool history = false)            override;
     virtual std::vector<uint32_t>    GetRocRegisters          (int ilink, bool history = false) override;
@@ -248,6 +253,17 @@ namespace trkdaq {
     virtual std::string              GetRocFwGitCommit(int Link) override;
 
     virtual int                      InitRocReadoutMode(std::ostream& Stream = std::cout)      override;
+    int                              InitReadoutROC(int                            Link,
+                                                    int                            RocReadoutMode,
+                                                    int                            DtcID,
+                                                    uint16_t                       DigitizationStart5ns,
+                                                    uint16_t                       DigitizationStop5ns,
+                                                    uint16_t                       EventWindowDelay5ns,
+                                                    const ControlRoc_Read_Input_t0& ReadSettings,
+                                                    std::ostream&                  Stream = std::cout);
+    int                              EnsureDigiRxLanesReady(int            Link,
+                                                            uint16_t       EnabledLanes,
+                                                            std::ostream& Stream = std::cout);
 //-----------------------------------------------------------------------------
 // ROC has 4 lanes: 2 CAL lanes (0x5) and 2 HV lanes (0xa)
 //-----------------------------------------------------------------------------

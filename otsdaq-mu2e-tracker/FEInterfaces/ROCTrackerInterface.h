@@ -1,10 +1,13 @@
 #ifndef _ots_ROCTrackerInterface_h_
 #define _ots_ROCTrackerInterface_h_
 
+#include <array>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "otsdaq-mu2e/FEInterfaces/ROCPolarFireCoreInterface.h"
 #include "otsdaq/DataManager/DataProducer.h"
@@ -21,6 +24,8 @@
 #include "otsdaq-mu2e-tracker/Ui/ProgramRoc.hh"
 
 #include "otsdaq-mu2e-tracker/Ui/ROC.hh"
+
+#include <nlohmann/json.hpp>
 
 namespace ots
 {
@@ -55,11 +60,48 @@ public:
 	virtual void onDTCReady();
 
 	using address_t = trkdaq::ROC::address_t;
+	std::string getFirmwareVersion(void) override;
+	void InitReadout(__ARGS__);
 	void ReadRegister(__ARGS__);
 	void ResetCounters(__ARGS__);
 	void FindAlignment(__ARGS__);
 	void SetThreshold(__ARGS__);
 	void MeasureThreshold(__ARGS__);
+
+	void EnableChargeInjection(__ARGS__);
+	void DisableChargeInjection(__ARGS__);
+
+	void ResetDigis(__ARGS__);
+	void ResetAndConfigure(__ARGS__);
+	void RebootMCU(__ARGS__);
+	void SetEventWindowDelay(__ARGS__);
+	void SetDigitizationWindow(__ARGS__);
+	void DigiRead(__ARGS__);
+	void PrintDigis(__ARGS__);
+	void Preflight(__ARGS__);
+	void DigiWrite(__ARGS__);
+	void ReadPanelID(__ARGS__);
+	void ReadSerialNumber(__ARGS__);
+	void MeasureThresholds(__ARGS__);
+	void FindThreshold(__ARGS__);
+	void FindThresholds(__ARGS__);
+	void SetChannelMask(__ARGS__);
+	std::map<std::string, std::string> getFEMacroInputDefaults(
+	    const std::string&                        feMacroName,
+	    const std::map<std::string, std::string>& currentInputValues) const override;
+	void NotoriousRead(__ARGS__);
+	void ConfigureDigis(__ARGS__);
+	void InitializeDigis(__ARGS__);
+	void DigiRW(__ARGS__);
+	void ReadSPI(__ARGS__);
+	void PrintStatus(__ARGS__);
+  void MeasureChannelRates(__ARGS__);
+
+	void FindAndSerializeThresholds(__ARGS__);
+	void DeserializeAndSetThresholds(__ARGS__);
+	void TestJSON(__ARGS__);
+
+	void UpdateChannelThresholds(__ARGS__);
 
 	// state machine
 	//----------------
@@ -133,6 +175,35 @@ protected:
 
 private:
   /**/
+
+	// format a per-channel threshold table from the flat 3*96 vector
+	// returned by trkdaq::ROC::ReadThresholds
+	// (layout: [3*ch+0]=HV, [3*ch+1]=CAL, [3*ch+2]=sum)
+	static std::string FormatThresholdTable(const std::vector<float>& Thresholds);
+
+	// format a per-channel DAC table from the flat 2*96 vector returned by
+	// trkdaq::ROC::FindThresholds (layout: [2*ch+0]=CAL, [2*ch+1]=HV)
+	static std::string FormatDacTable(const std::vector<DTCLib::roc_data_t>& Dacs);
+
+	// parse the parsed-field printout emitted by trkdaq::ROC::NotoriousRead
+	// (one "label : value(s)" per line) into a label->value map, with each
+	// label trimmed of surrounding whitespace
+	static std::map<std::string, std::string> ParseNotoriousReadOutput(
+	    const std::string& Text);
+
+	std::array<uint32_t, 3> GetConfiguredChannelMasks() const;
+	std::string ResolveThresholdFilePath(
+	    const std::string& rootOverride = "", const std::string& setOverride = "");
+
+  // format a per-channel rates table from a vector-of-tuples
+  // returned by trkdaq::ROC::ChannelRates
+  static std::string FormatRatesTable(const std::vector<trkdaq::ROC::rates_t>& rates);
+
+	static bool SafeSerialize(std::string path,
+														std::string key,
+														nlohmann::json value);
+	static nlohmann::json SafeDeserialize(std::string path,
+													              std::string key);
 
 	// clang-format on
 };

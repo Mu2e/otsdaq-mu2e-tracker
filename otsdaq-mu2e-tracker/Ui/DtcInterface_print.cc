@@ -36,11 +36,12 @@ namespace trkdaq {
       uint32_t dat;
 
       dat = fDtc->ReadROCRegister(link,Reg,100);
-      text += Form("     0x%04x",dat);
+      if (Format & 0x2) text += Form("%11u",static_cast<unsigned int>(dat));
+      else              text += Form("     0x%04x",dat);
     }
     std::string sreg = Form("reg(%2i)",Reg);
 
-    if (Format == 1) text += Form(" %s",Desc.data());
+    if (Format & 0x1) text += Form(" %s",Desc.data());
     Stream << Form("%-18s %s\n",sreg.data(),text.data());
 
     TLOG(TLVL_DEBUG+1) << std::format("-- END");
@@ -67,10 +68,11 @@ namespace trkdaq {
       iw1 = fDtc->ReadROCRegister(link,Reg  ,100);
       iw2 = fDtc->ReadROCRegister(link,Reg+1,100);
       iw  = (iw2 << 16) | iw1;
-      text += Form(" 0x%08x",iw);
+      if (Format & 0x2) text += Form("%11u",static_cast<unsigned int>(iw));
+      else              text += Form(" 0x%08x",iw);
     }
 
-    if (Format == 1) text += Form(" %s",Desc.data());
+    if (Format & 0x1) text += Form(" %s",Desc.data());
 
     std::string sreg = Form("reg(%2i)<<16|reg(%2i)",Reg+1,Reg);
 
@@ -131,6 +133,10 @@ namespace trkdaq {
 
     reg =  8; desc = "ROC pattern mode ??";
     PrintRocRegister(reg,desc,Format,link_mask,Stream);
+
+    // Keep the identity, FIFO status, and pattern-mode values above in hex.
+    // The remaining values are counts, delays, positions, or tags.
+    Format |= 0x2;
 
     reg = 60; desc = "ROC readout timeout delay ";
     PrintRocRegister(reg,desc,Format,link_mask,Stream);
