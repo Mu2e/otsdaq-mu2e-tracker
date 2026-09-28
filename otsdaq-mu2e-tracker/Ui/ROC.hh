@@ -6,8 +6,10 @@
 #define __trkdaq_roc_hh__
 
 // stl
+#include <array>
 #include <chrono>
 #include <memory>
+#include <functional>
 #include <streambuf>
 #include <thread>
 
@@ -47,6 +49,7 @@ namespace trkdaq{
                             uint16_t                       digitizationStart5ns,
                             uint16_t                       digitizationStop5ns,
                             uint8_t                        dtcId,
+                            uint16_t                       eventWindowDelay5ns,
                             const ControlRoc_Read_Input_t0& readSettings,
                             std::ostream&                  output);
             int InitReadoutMode(std::ostream& Stream = std::cout);
@@ -99,6 +102,9 @@ namespace trkdaq{
             // identity
             int ReadPanelID(int PrintLevel = 0);
             roc_serial_t ReadSerialNumber();
+            ControlRoc_DeviceID_t ReadDeviceInfo();
+            std::string ReadFirmwareGitCommit();
+            uint32_t ReadUserCode();
             int ReadThresholds(std::vector<float>& Thr,
                                uint32_t MaskC = 0xFFFFFFFF,
                                uint32_t MaskD = 0xFFFFFFFF,
@@ -113,7 +119,8 @@ namespace trkdaq{
                                int PreampType,
                                float ThresholdMv,
                                float ToleranceMv,
-                               DTCLib::roc_data_t& Out);
+                               DTCLib::roc_data_t& Out,
+                               ThresholdSearchResult* Detail = nullptr);
 
             // find thresholds for both preamps (CAL then HV) of a single channel.
             // returns the number of searches which failed to converge.
@@ -129,7 +136,9 @@ namespace trkdaq{
             // returns the number of searches which failed to converge.
             int FindThresholds(float ThresholdMv,
                                float ToleranceMv,
-                               std::vector<DTCLib::roc_data_t>& Out);
+                               std::vector<DTCLib::roc_data_t>& Out,
+                               std::vector<ThresholdSearchResult>* Details = nullptr,
+                               const std::function<void(size_t, size_t)>& Progress = {});
 
             // the notorious "read" command: program an acquisition and read
             // back the resulting configuration. all 16 input words are exposed.
@@ -159,7 +168,8 @@ namespace trkdaq{
 
             // read per-channel trigger rates
             using rates_t = std::tuple<float,float,float>;
-            int ChannelRates(uint16_t tdc_mode, std::vector<rates_t >& rates);
+            int ChannelRates(uint16_t tdc_mode, std::vector<rates_t >& rates,
+                             std::array<uint16_t, 6>* masksBeforeRead = nullptr);
 
             int EnableChargeInjection(int FirstChannelMask = 0x10,
                                       int DutyCycle        = 10  ,

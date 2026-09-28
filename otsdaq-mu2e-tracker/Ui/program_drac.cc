@@ -9,9 +9,71 @@
 
 #include <boost/algorithm/string.hpp>
 #include <thread>
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <limits>
+#include <stdexcept>
 #include "nlohmann/json.hpp"
 #include "TRACE/tracemf.h"
 #define  TRACE_NAME "program_drac"
+
+namespace {
+trkdaq::DtcInterface* programming_target(trkdaq::DtcInterface* dtc, int link) {
+  if (link < 0 || link >= 6) throw std::runtime_error("Programming requires one ROC link, 0-5");
+  if (!dtc) dtc = trkdaq::DtcInterface::Instance(-1);
+  if (!dtc || !dtc->fDtc || !dtc->LinkEnabled(link) || !dtc->LinkLocked(link))
+    throw std::runtime_error("Programming requires an initialized DTC and an enabled, locked ROC link");
+  return dtc;
+}
+
+// Every attempt has an I/O timeout; the attempt count bounds the whole poll.
+// These are retry budgets, not strict wall-clock deadlines.
+int wait_register(trkdaq::DtcInterface* dtc, int link, uint16_t address,
+                  uint16_t mask, uint16_t expected, int attempts, int delayUs,
+                  int ioTimeoutMs, uint16_t& last) {
+  for (int attempt=0; attempt<attempts; ++attempt) {
+    last = dtc->fDtc->ReadROCRegister(DTCLib::DTC_Link_ID(link), address, ioTimeoutMs);
+    if ((last & mask) == expected) return 0;
+    if (address == 128 && (last & 0x8000) && (last & 0x7fff)) {
+      TLOG(TLVL_ERROR) << std::format("DTC:{} ROC:{} R128 command error:0x{:04x}",dtc->PcieAddr(),link,last);
+      return -3;
+    }
+    if (attempt+1 < attempts) std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
+  }
+  TLOG(TLVL_ERROR) << std::format("DTC:{} ROC:{} R{} polling exhausted {} attempts; value:0x{:04x}",
+                                 dtc->PcieAddr(),link,address,attempts,last);
+  return -2;
+}
+
+void check_image(const std::string& filename, int offset) {
+  const auto size = std::filesystem::file_size(filename);
+  if (offset < 0 || size == 0 || size > uint64_t(std::numeric_limits<int>::max()) ||
+      size + uint64_t(offset) > uint64_t(std::numeric_limits<int>::max()))
+    throw std::runtime_error("Invalid programming image size or flash range: " + filename);
+  std::ifstream file(filename, std::ios::binary);
+  if (!file) throw std::runtime_error("Programming image is not readable: " + filename);
+}
+
+std::string identity_hex(std::string value, size_t digits) {
+  if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'')
+    value = value.substr(1,value.size()-2);
+  if (value.starts_with("0x") || value.starts_with("0X")) value.erase(0,2);
+  if (value.size() != digits || value.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+    throw std::runtime_error("Malformed expected or read-back firmware identity");
+  for (auto& c : value) if (c >= 'A' && c <= 'F') c += 'a'-'A';
+  return value;
+}
+
+void require_identity(const program_drac::FwVersion_t& version) {
+  // Refuse activation before the first write if expected values are unavailable.
+  identity_hex(version.expected_design_version,4);
+  identity_hex(version.expected_usercode,8);
+  if (version.bin_file.load_flag > 0 || !version.expected_git_commit.empty())
+    identity_hex(version.expected_git_commit,40);
+}
+} // namespace
+
 
 //-----------------------------------------------------------------------------
 // GoldenVXX should always be the first image ( index 0, offset 0x10000)
@@ -88,6 +150,10 @@ program_drac::program_drac(const char* ConfigFile, bool PrintConfig) {
 
       fv.name               = o["version"];
       fv.index              = o["index"];
+      const auto identity = o.value("expected_identity", nlohmann::json::object());
+      fv.expected_design_version = identity.value("design_version", "");
+      fv.expected_usercode = identity.value("usercode", "");
+      fv.expected_git_commit = identity.value("git_commit", "");
       fv.spi_file.load_flag = o["fpga_image"]["load_flag"];
       std::string s         = o["fpga_image"]["offset"];
       fv.spi_file.offset    = std::stoi(s,nullptr,0);
@@ -156,6 +222,8 @@ const program_drac::ImageData_t* program_drac::get_image_data(const std::string&
 //-----------------------------------------------------------------------------
 // void spi_clear(int Link, int Address, int NBytes) {
 int program_drac::spi_clear_memory(trkdaq::DtcInterface* Dtc_i, int Link, int Offset, int NBytes, int DebugMode) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (Offset < 0 || NBytes <= 0 || uint64_t(Offset)+uint64_t(NBytes) > uint64_t(std::numeric_limits<int>::max())) return -1;
   int rc(0);
 
   if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
@@ -180,7 +248,8 @@ int program_drac::spi_clear_memory(trkdaq::DtcInterface* Dtc_i, int Link, int Of
   }
 
   uint16_t u;
-  while ((u = Dtc_i->fDtc->ReadROCRegister(roc,128,100)) != 0x8000) {};
+  if (wait_register(Dtc_i, Link, 128, 0xffff, 0x8000, 5000, 5000, 100, u) != 0)
+    return -2;
 
   if (u != 0x8000) {
     TLOG(TLVL_ERROR) << std::format("timeout reg:{:03d} val:0x{:04x}\n",128,u);
@@ -197,50 +266,59 @@ int program_drac::spi_clear_memory(trkdaq::DtcInterface* Dtc_i, int Link, int Of
 // program IAP
 //-----------------------------------------------------------------------------
 int program_drac::spi_program_roc(trkdaq::DtcInterface* Dtc_i, int Link, const std::string& Version) {
-  int rc(0);
-
-  if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
-
+  Dtc_i = programming_target(Dtc_i, Link);
   const FwVersion_t* ver = get_version(Version);
-  if (ver == nullptr) {
-    TLOG(TLVL_ERROR) << std::format("image {}not found. BAIL OUT",Version);
-    return -1;
-  }
-
-  TLOG(TLVL_INFO) << std::format("-- START programming PCIE:{} Link:{} Version:{} index:{}\n",Dtc_i->PcieAddr(),Link,Version,ver->index);
-
-
-  bool increment_address(false);
-                                              // 5 words
-  std::vector<uint16_t> input;
-
-  input.push_back(PROGRAM_IAP_W_INDEX);                 // SPI clear
-  input.push_back( ver->index        & 0xFFFF);  //
-  input.push_back((ver->index >> 16) & 0xFFFF);  //
-  input.push_back(0);  //
-  input.push_back(0);
-
-  auto roc  = DTCLib::DTC_Link_ID(Link);
-  Dtc_i->fDtc->WriteROCBlock(roc,RREG,input,false,increment_address,100);
-//-----------------------------------------------------------------------------
-// 25 sec was not enough on the tower, 30 sec was OK for the first test.
-// increase the sleep time to 35 sec - there were ROCs looked as they needed
-// more than 30 sec
-//-----------------------------------------------------------------------------
-  sleep(35);
-  TLOG(TLVL_INFO) << std::format("after sleep\n");
-
-                                        // the fw has been reloaded to FPGA, reset the DTC
+  if (!ver || ver->index < 0 || ver->index >= 16 || ver->spi_file.load_flag <= 0) return -1;
+  require_identity(*ver);
+  const std::string expectedDesign = identity_hex(ver->expected_design_version,4);
+  const std::string expectedUser = identity_hex(ver->expected_usercode,8);
+  TLOG(TLVL_INFO) << std::format("Activating DTC:{} ROC:{} version:{} index:{}; parent DTC reset/readout initialization follows",
+                                 Dtc_i->PcieAddr(), Link, Version, ver->index);
+  std::vector<uint16_t> input{PROGRAM_IAP_W_INDEX, uint16_t(ver->index), 0, 0, 0};
+  const auto roc = DTCLib::DTC_Link_ID(Link);
+  Dtc_i->fDtc->WriteROCBlock(roc,RREG,input,false,false,100);
+  sleep(35); // Existing recovery delay while the FPGA reloads.
   Dtc_i->fDtc->SoftReset();
-  Dtc_i->InitReadout(-1,1);
+  uint16_t status=0;
+  if (wait_register(Dtc_i, Link, 128, 0xffff, 0x8000, 5000, 5000, 1000, status) != 0) return -2;
+  const int programmingRC = Dtc_i->fDtc->ReadROCRegister(roc,REG_STATUS,1000);
+  if (programmingRC != 0) return programmingRC;
+  const int initRC = Dtc_i->InitReadout(-1,1);
+  if (initRC != 0) return initRC;
 
-  return rc;
+  trkdaq::ControlRoc_DeviceID_t info;
+  int rc = Dtc_i->ControlRoc_ReadDeviceID(Link,info,0,std::cout);
+  if (rc != 0) return rc;
+  std::vector<uint16_t> user;
+  rc = Dtc_i->RocBlockRead(Link,280,user,4); // READUSERCODE
+  if (rc != 0) return rc;
+  if (user.size() != 4) return -4;
+  uint32_t userCode=0;
+  for (size_t i=0;i<4;++i) {
+    if (user[i] > 0xff) return -4;
+    userCode |= uint32_t(user[i]) << (8*i);
+  }
+  const auto actualDesign = identity_hex(info.DesignVer,4);
+  const auto actualUser = std::format("{:08x}",userCode);
+  TLOG(TLVL_INFO) << std::format("DTC:{} ROC:{} activated identity: DesignVer={} UserCode={}",
+                                 Dtc_i->PcieAddr(),Link,actualDesign,actualUser);
+  if (actualDesign != expectedDesign || actualUser != expectedUser) return -5;
+  if (!ver->expected_git_commit.empty()) {
+    std::string commit;
+    rc = Dtc_i->ControlRoc_ReadGitCommit(commit,Link,0,std::cout);
+    if (rc != 0) return rc;
+    TLOG(TLVL_INFO) << std::format("DTC:{} ROC:{} activated git_commit={}",Dtc_i->PcieAddr(),Link,commit);
+    if (identity_hex(commit,40) != identity_hex(ver->expected_git_commit,40)) return -5;
+  }
+  return 0;
 }
 
 
 
 //-----------------------------------------------------------------------------
 void program_drac::spi_program_iap_w_index(trkdaq::DtcInterface* Dtc_i, int Link, int Index) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (Index < 0 || Index >= 16) throw std::runtime_error("Invalid ROC IAP target");
   if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
 
   bool increment_address(false);
@@ -259,10 +337,12 @@ void program_drac::spi_program_iap_w_index(trkdaq::DtcInterface* Dtc_i, int Link
   sleep(40);
                                         // wait till the command is executed
   uint16_t u;
-  while ((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000) {};
+  if (wait_register(Dtc_i, Link, 128, 0xffff, 0x8000, 5000, 5000, 1000, u) != 0)
+    throw std::runtime_error("ROC IAP did not complete successfully");
 
   uint16_t status;
   status = Dtc_i->fDtc->ReadROCRegister(roc,REG_STATUS,1000);
+  if (status != 0) throw std::runtime_error("ROC IAP returned a programming error");
   std::cout << __func__ << ":END status:" << status << std::endl;
 }
 
@@ -275,7 +355,11 @@ void program_drac::spi_program_iap_w_index(trkdaq::DtcInterface* Dtc_i, int Link
 //-----------------------------------------------------------------------------
 int  program_drac::spi_reprogram_roc(trkdaq::DtcInterface* Dtc_i, int LinkMask) {
   int rc(0);
-
+  if (LinkMask == 0) return 0;
+  if ((LinkMask & ~0x111111) != 0 || _drac_fw.size() < 2) return -1;
+  if (!Dtc_i) Dtc_i = trkdaq::DtcInterface::Instance(-1);
+  if (!Dtc_i) return -1;
+  require_identity(_drac_fw[1]);
   for (int lnk=0; lnk<6; lnk++) {
     int requested = (LinkMask >> 4*lnk) & 0x1;
     if (requested == 0)                                     continue;
@@ -290,14 +374,14 @@ int  program_drac::spi_reprogram_roc(trkdaq::DtcInterface* Dtc_i, int LinkMask) 
                                         // upload 'GoldenVXX'
     FwVersion_t* v0 = &_drac_fw[0];
     rc = spi_write_version(Dtc_i,lnk,v0->name);
-    if (rc < 0)                                             return rc;
+    if (rc != 0)                                             return rc;
                                         // upload 'ROCVXX'
     FwVersion_t* v1 = &_drac_fw[1];
     rc = spi_write_version(Dtc_i,lnk,v1->name);
-    if (rc < 0)                                             return rc;
+    if (rc != 0)                                             return rc;
                                         // program 'ROCVXX'
     rc = spi_program_roc  (Dtc_i,lnk,v1->name);
-    if (rc < 0)                                             return rc;
+    if (rc != 0)                                             return rc;
   }
   return rc;
 }
@@ -306,6 +390,8 @@ int  program_drac::spi_reprogram_roc(trkdaq::DtcInterface* Dtc_i, int LinkMask) 
 // program IAP by address - not really needed
 //-----------------------------------------------------------------------------
 void program_drac::spi_program_iap_w_address(trkdaq::DtcInterface* Dtc_i, int Link, int ImageOffset) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (ImageOffset < 0) throw std::runtime_error("Invalid ROC IAP target");
   if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
 
   TLOG(TLVL_DEBUG) << std::format("START PCIE:{} Link:{}",Dtc_i->PcieAddr(),Link);
@@ -325,10 +411,12 @@ void program_drac::spi_program_iap_w_address(trkdaq::DtcInterface* Dtc_i, int Li
 
                                         // wait till the command is executed
   uint16_t u;
-  while ((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000) {};
+  if (wait_register(Dtc_i, Link, 128, 0xffff, 0x8000, 5000, 5000, 1000, u) != 0)
+    throw std::runtime_error("ROC IAP did not complete successfully");
 
   uint16_t status;
   status = Dtc_i->fDtc->ReadROCRegister(roc,REG_STATUS,1000);
+  if (status != 0) throw std::runtime_error("ROC IAP returned a programming error");
   TLOG(TLVL_DEBUG) << std::format("END  PCIE:{} Link:{} status:{}",Dtc_i->PcieAddr(),Link,status);
 }
 
@@ -340,76 +428,25 @@ void program_drac::spi_program_iap_w_address(trkdaq::DtcInterface* Dtc_i, int Li
 // upon success returns rc=0, otherwise rc<0
 //-----------------------------------------------------------------------------
 int program_drac::spi_read_record(trkdaq::DtcInterface* Dtc_i, int Link, uint32_t SpiOffset, int NWords, uint16_t* Res, int DebugMode) {
-  int rc(0);
-
-  TLOG(TLVL_DEBUG+2) << std::format("START PCIE:{} Link:{} SpiOffset:0x{:08x} NWords:{}",Dtc_i->PcieAddr(),Link,SpiOffset,NWords);
-
-  if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
-  auto roc  = DTCLib::DTC_Link_ID(Link);
-
-  int nw_read_tot = 0;
-  // int const max_record_size(1024);                // in bytes
-  int const max_record_size(254);                 // in bytes
-
-  int max_nwr    = max_record_size/2;
-  int spi_offset = SpiOffset;                     // offset in SPI memory of the record to be read out
-
-  int nreads = (NWords-1)/max_nwr + 1;
-  for (int i=0; i<nreads; ++i) {
-    int nw      = max_nwr;
-    int nw_left = NWords-nw_read_tot;
-
-    if (nw_left < nw) nw = nw_left;
-
-    bool increment_address(false);
-    std::vector<uint16_t> input;
-
-    input.push_back(SPI_FLASH_READ);              // SPI flash read
-    input.push_back((spi_offset      ) & 0xFFFF); // starting address LSB
-    input.push_back((spi_offset >> 16) & 0xFFFF); // starting address MSB
-    input.push_back(nw*2);                        // number of bytes to read
-    input.push_back(0);                           // 5 words total
-
-    Dtc_i->fDtc->WriteROCBlock(roc,RREG,input,false,increment_address,100);
-
-    uint16_t u;
-    while ((u = Dtc_i->fDtc->ReadROCRegister(roc,128,100)) != 0x8000) {};
-    if (u != 0x8000) {
-      TLOG(TLVL_ERROR) << std::format(" : timeout detected: reg:{:03d} val:0x{:04x}",128,u);
-      rc = -1;
-      return rc;
-    }
-
-    int nwr = Dtc_i->fDtc->ReadROCRegister(roc,129,100);  // should return nw+4
-    if (DebugMode & 0x2) {
-      TLOG(TLVL_DEBUG+1) << std::format("[{}:{}] nw:{} nwr:{}",__func__,__LINE__,nw,nwr);
-    }
-//-----------------------------------------------------------------------------
-// now actually read the data
-//-----------------------------------------------------------------------------
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (NWords <= 0 || uint64_t(SpiOffset)+2*uint64_t(NWords) > uint64_t(std::numeric_limits<int>::max())) return -1;
+  const auto roc = DTCLib::DTC_Link_ID(Link);
+  for (int offset=0;offset<NWords;offset+=127) {
+    const int nw=std::min(127,NWords-offset);
+    const uint32_t address=SpiOffset+2*uint32_t(offset);
+    std::vector<uint16_t> input{SPI_FLASH_READ,uint16_t(address),uint16_t(address>>16),uint16_t(nw*2),0};
+    Dtc_i->fDtc->WriteROCBlock(roc,RREG,input,false,false,100);
+    uint16_t status=0;
+    if (wait_register(Dtc_i,Link,128,0xffff,0x8000,5000,5000,100,status) != 0) return -2;
+    if (wait_register(Dtc_i,Link,129,0xffff,nw+4,1000,5000,100,status) != 0) return -3;
     std::vector<uint16_t> buf;
-    Dtc_i->RocBlockRead(Link,RREG,buf);
-
-    if (DebugMode & 0x8) {
-      int nw_read = buf.size();
-      std::cout << std::format("[{}:{}] read number:{} offset:0x{:08x} nw:{} nw_read:{}\n",__func__,__LINE__,i,spi_offset,nw,nw_read);
-      Dtc_i->PrintBuffer(buf.data(),nw_read,spi_offset);
-    }
-
-    if (Res != nullptr) {
-      memcpy(Res,buf.data(),2*nw);
-    }
-//-----------------------------------------------------------------------------
-// update counters
-//-----------------------------------------------------------------------------
-    spi_offset  += 2*nw;
-    nw_read_tot += nw;
+    // Consume the pending reply directly; RocBlockRead would launch another command.
+    Dtc_i->fDtc->ReadROCBlock(buf,roc,RREG,nw,false,1000);
+    if (buf.size() != size_t(nw)) return -4;
+    if (DebugMode & 0x8) Dtc_i->PrintBuffer(buf.data(),buf.size(),address);
+    if (Res) std::copy(buf.begin(),buf.end(),Res+offset);
   }
-
-  TLOG(TLVL_DEBUG+1) << std::format("END   PCIE:{} Link:{} SpiOffset:0x{:08x} NWords:{} nw_read_tot:{} rc:{}",
-                                    Dtc_i->PcieAddr(),Link,SpiOffset,NWords,nw_read_tot,rc);
-
-  return rc;
+  return 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -419,62 +456,28 @@ int program_drac::spi_read_record(trkdaq::DtcInterface* Dtc_i, int Link, uint32_
 // exit in case of an error
 //-----------------------------------------------------------------------------
 int program_drac::spi_read_segment(trkdaq::DtcInterface* Dtc_i, int Link, uint32_t SpiOffset, int NBytes, std::vector<char>& Res, int DebugMode) {
-  int rc(0);
-  //   std::mutex mtx; // For thread-safe output
-
-  //  int record_size(1024);              // future version, not on the station yet
-  int  record_size(254);                  // can only read 254 bytes (127 shorts) at a time
-
-  //  int  first_addr = SpiOffset;            // initial offset in SPI memory
-
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (NBytes <= 0 || NBytes > 0x10000 ||
+      uint64_t(SpiOffset) + uint64_t(NBytes) > uint64_t(std::numeric_limits<int>::max())) return -1;
   Res.clear();
-  Res.reserve(NBytes);
-
-  int report_step = record_size*40;
-  int report_mark = report_step;
-
-  TLOG(TLVL_DEBUG) << std::format("request to read a segment: PCIE:{} Link:{} NBytes:{} SpiOffset:0x{:08x} report_step:{} bytes\n",
-                                  Dtc_i->PcieAddr(),Link,NBytes,SpiOffset,report_step);
-//-----------------------------------------------------------------------------
-// can read only 254 bytes (127 shorts) at a time
-//-----------------------------------------------------------------------------
-  int  nreads     = (NBytes-1)/record_size + 1;
-  int  nb_read    = 0;
-  for (int i=0; i<nreads; i++) {
-    int nb      = record_size;
-    int nb_left = NBytes-nb_read;
-    if (nb_left < record_size) nb = nb_left;
-                                        // read nb_left bytes
-//-----------------------------------------------------------------------------
-// read next record
-//-----------------------------------------------------------------------------
-    int      nw         = (nb-1)/2 + 1;
-    uint32_t first_addr = SpiOffset+nb_read;
-    {
-      rc = spi_read_record(Dtc_i, Link, first_addr, nw, (uint16_t*) (Res.data()+nb_read),DebugMode);
-    }
-    if (rc < 0) {
-      TLOG(TLVL_ERROR) << std::format(" read ERROR rc:{} . BAIL OUT",__func__,__LINE__,rc);
-      return rc;
-    }
-
-    nb_read += nb;
-
-    if (nb_read >= report_mark) {
-      TLOG(TLVL_DEBUG) << std::format("-- PCIE:{} Link:{} read record nb:{}  total nb_read:{} first_address:0x{:08x}",
-                                     Dtc_i->PcieAddr(),Link,nb,nb_read,first_addr);
-      report_mark += report_step;
-    }
+  Res.resize(NBytes);
+  for (int offset=0; offset<NBytes; offset+=254) {
+    const int nb = std::min(254, NBytes-offset);
+    std::vector<uint16_t> words((nb+1)/2);
+    const int rc = spi_read_record(Dtc_i, Link, SpiOffset+offset, words.size(), words.data(), DebugMode);
+    if (rc != 0) { Res.clear(); return rc; }
+    for (int i=0; i<nb; ++i) Res[offset+i] = char((words[i/2] >> (8*(i%2))) & 0xff);
   }
-
-  TLOG(TLVL_DEBUG) << std::format("DONE, PCIE:{} Link:{} rc:{} total nb_read:{} nreads:{}",Dtc_i->PcieAddr(),Link,rc,nb_read,nreads);
-  return rc;
+  return 0;
 }
 
 //-----------------------------------------------------------------------------
 // validate image already writen to SPI memory
 //-----------------------------------------------------------------------------
 int program_drac::spi_validate_segment(trkdaq::DtcInterface* Dtc_i, int Link, const ImageData_t* Image, int Segment, int DebugMode) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (!Image) return -1;
+  check_image(Image->fn, Image->offset);
   int rc = 0;
 //-----------------------------------------------------------------------------
 // open input file and determine its size
@@ -486,7 +489,9 @@ int program_drac::spi_validate_segment(trkdaq::DtcInterface* Dtc_i, int Link, co
   }
 
   file.seekg(0, std::ios::end);
-  int fsize = file.tellg();
+  const auto fileSize = file.tellg();
+  if (fileSize <= 0 || fileSize > std::numeric_limits<int>::max()) return -1;
+  int fsize = static_cast<int>(fileSize);
   file.seekg(0, std::ios::beg);
 //-----------------------------------------------------------------------------
 // clear the spi memory for image at index *** ###
@@ -500,10 +505,12 @@ int program_drac::spi_validate_segment(trkdaq::DtcInterface* Dtc_i, int Link, co
   int const segment_size(0x10000); // the SPI memory is cleared in 64K segments
 
   std::vector<char> fileData(fsize);
-  file.read((char*) &fileData[0], fsize);
+  file.read(fileData.data(), fsize);
+  if (!file) return -1;
 
   int nb_read_tot(0);
                                                  // offset in the image file
+  if (Segment < 0 || uint64_t(Segment)*segment_size >= uint64_t(fsize)) return -1;
   int segment_offset  = Segment*segment_size;
 
   int nb_to_read     = segment_size;
@@ -554,6 +561,7 @@ int program_drac::spi_validate_segment(trkdaq::DtcInterface* Dtc_i, int Link, co
 // validate image already writen to SPI memory
 //-----------------------------------------------------------------------------
 int program_drac::spi_validate_image(trkdaq::DtcInterface* Dtc_i, int Link, const std::string& Version, const std::string& Type, int DebugMode) {
+  Dtc_i = programming_target(Dtc_i, Link);
   int rc = 0;
 //-----------------------------------------------------------------------------
 // open input file and determine its size
@@ -571,7 +579,9 @@ int program_drac::spi_validate_image(trkdaq::DtcInterface* Dtc_i, int Link, cons
   }
 
   file.seekg(0, std::ios::end);
-  int fsize = file.tellg();
+  const auto fileSize = file.tellg();
+  if (fileSize <= 0 || fileSize > std::numeric_limits<int>::max()) return -1;
+  int fsize = static_cast<int>(fileSize);
   file.seekg(0, std::ios::beg);
 
   TLOG(TLVL_INFO) << std::format("-- START validating PCIE:{} Link:{} Version:{} Type:{} fn:{} fsize:{}\n",
@@ -584,7 +594,8 @@ int program_drac::spi_validate_image(trkdaq::DtcInterface* Dtc_i, int Link, cons
   int const segment_size(0x10000); // the SPI memory is cleared in 64K segments
 
   std::vector<char> fileData(fsize);
-  file.read((char*) &fileData[0], fsize);
+  file.read(fileData.data(), fsize);
+  if (!file) return -1;
 
   int n64k_segments = (fsize-1)/0x10000 + 1;
 
@@ -646,6 +657,15 @@ int program_drac::spi_validate_image(trkdaq::DtcInterface* Dtc_i, int Link, cons
 // what's written is defined by the config file
 //-----------------------------------------------------------------------------
 int program_drac::spi_write_directory(trkdaq::DtcInterface* Dtc_i, int Link) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  int catalogIndex=0;
+  for (const auto& version : _drac_fw) {
+    if (version.spi_file.load_flag <= 0) continue;
+    if (catalogIndex >= 16 || version.index != catalogIndex || version.spi_file.offset < 0)
+      return -1;
+    ++catalogIndex;
+  }
+  if (catalogIndex == 0) return -1;
   int rc(0);
   if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
 
@@ -687,9 +707,24 @@ int program_drac::spi_write_directory(trkdaq::DtcInterface* Dtc_i, int Link) {
 //-----------------------------------------------------------------------------
 // hopefully, OK. lets see how it goes
 //------------------------------------------------------------------------------
+  int      wait_time_us(5000),  kMaxTries(5000);
   uint16_t u;
-  while ((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000) {};
 
+  int ntries = 0;
+  while (((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000)  and (ntries < kMaxTries)) {
+    std::this_thread::sleep_for(std::chrono::microseconds(wait_time_us));
+    ntries++;
+  };
+
+  if (ntries > 0) {
+    TLOG(TLVL_DEBUG+1) << std::format("DTC:{} ROC:{} polling R128 took {:4} extra attempts {} us each",
+                                      Dtc_i->PcieAddr(),Link,ntries,wait_time_us);
+    if (ntries == kMaxTries) {
+      TLOG(TLVL_ERROR) << std::format("DTC:{} ROC:{} : R128 not ready after {:4} polls of {:4} us. BAIL OUT",
+                                      Dtc_i->PcieAddr(),Link,ntries,wait_time_us);
+      return -2;
+    }
+  }
                                         // read return code
   rc = Dtc_i->fDtc->ReadROCRegister(roc,132,1000);
 
@@ -702,11 +737,15 @@ int program_drac::spi_write_directory(trkdaq::DtcInterface* Dtc_i, int Link) {
 // returns 0 if OK and an error code otherwise
 //-----------------------------------------------------------------------------
 int program_drac::spi_write_record(trkdaq::DtcInterface* Dtc_i, int Link, int FirstAddr, int NWords, uint16_t* Data, int DebugMode) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (NWords <= 0 || NWords > 512 || !Data || FirstAddr < 0 || uint64_t(FirstAddr)+2*uint64_t(NWords) > uint64_t(std::numeric_limits<int>::max())) return -1;
   if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
 
   bool increment_address(false);
   bool done             (false);
   int  ntries           (0);
+
+  TLOG(TLVL_DEBUG+1) << std::format("-- START: DTC:{} ROC:{}",Dtc_i->PcieAddr(),Link);
 
   auto roc  = DTCLib::DTC_Link_ID(Link);
 
@@ -728,7 +767,7 @@ int program_drac::spi_write_record(trkdaq::DtcInterface* Dtc_i, int Link, int Fi
     Dtc_i->fDtc->WriteROCBlock(roc,RREG,input,false,increment_address,100);
     ntries += 1;
 //-----------------------------------------------------------------------------
-// the suspicion is tChat sometimes the ROC doesn't recieve all data
+// the suspicion is that sometimes the ROC doesn't recieve all data
 // potential workaround: read ROC register 0 multiple times, till the read succeeds
 // that provides "fake data" the ROC needs to complete reading of the missing part of
 // the data
@@ -788,11 +827,26 @@ int program_drac::spi_write_record(trkdaq::DtcInterface* Dtc_i, int Link, int Fi
   if (not done) {
                                         // tried to write record 5 times, didn't succeed, bail out
     TLOG(TLVL_ERROR) << std::format("couldn't read register 0. BAIL OUT");
-
+    return -2;
   }
 
+  int      wait_time_us(2000),  kMaxTries(1000);
   uint16_t u;
-  while ((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000) {};
+
+  ntries = 0;
+  while (((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000)  and (ntries < kMaxTries)) {
+    std::this_thread::sleep_for(std::chrono::microseconds(wait_time_us));
+    ntries++;
+  };
+
+  if (ntries > 0) {
+    TLOG(TLVL_DEBUG+1) << std::format("DTC:{} ROC:{} polling R128 took {:4} extra attempts {} us each",
+                                      Dtc_i->PcieAddr(),Link,ntries,wait_time_us);
+    if (ntries == kMaxTries) {
+      TLOG(TLVL_ERROR) << std::format("DTC:{} ROC:{} : R128 not ready after {:4} polls. BAIL OUT", Dtc_i->PcieAddr(),Link,ntries);
+      return -2;
+    }
+  }
 
   int rc = Dtc_i->fDtc->ReadROCRegister(roc,132,1000);
 
@@ -804,9 +858,7 @@ int program_drac::spi_write_record(trkdaq::DtcInterface* Dtc_i, int Link, int Fi
     }
   }
 
-  if (DebugMode & 0x1) {
-    std::cout << __func__ << ":END rc:" << rc << std::endl;
-  }
+  TLOG(TLVL_DEBUG+1) << std::format("-- END: rc:{}",rc);
   return rc;
 }
 
@@ -814,6 +866,8 @@ int program_drac::spi_write_record(trkdaq::DtcInterface* Dtc_i, int Link, int Fi
 // write a single 64K byte segment (or less) . Return in case of an error
 //-----------------------------------------------------------------------------
 int program_drac::spi_write_segment(trkdaq::DtcInterface* Dtc_i, int Link, const char* Data, int NBytes, int SpiOffset, int DebugMode) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (NBytes <= 0 || NBytes > 0x10000 || !Data || SpiOffset < 0 || uint64_t(SpiOffset)+uint64_t(NBytes) > uint64_t(std::numeric_limits<int>::max())) return -1;
   const int record_size (0x400);   // write 1Kbytes blocks
   int rc(0);
 
@@ -840,9 +894,13 @@ int program_drac::spi_write_segment(trkdaq::DtcInterface* Dtc_i, int Link, const
 
       // std::this_thread::sleep_for(std::chrono::microseconds(1000));
       int spi_offset = first_addr+nb_written;             // offset in bytes
-      uint16_t* data = (uint16_t*) (Data+nb_written);
-      int nw         = (nb-1)/2 + 1;
-      rc      = spi_write_record(Dtc_i,Link,spi_offset,nw,data,DebugMode);
+      std::vector<uint16_t> words((nb+1)/2, 0xffff);
+      for (int i=0; i<nb; ++i) {
+        const uint16_t byte = static_cast<unsigned char>(Data[nb_written+i]);
+        const int shift = 8*(i%2);
+        words[i/2] = (words[i/2] & ~(0xffu << shift)) | (byte << shift);
+      }
+      rc = spi_write_record(Dtc_i,Link,spi_offset,words.size(),words.data(),DebugMode);
 
       std::this_thread::sleep_for(std::chrono::microseconds(1000));
       if (rc != 0) {
@@ -879,6 +937,9 @@ int program_drac::spi_write_segment(trkdaq::DtcInterface* Dtc_i, int Link, const
 // NWrites     : number of records to write, -1: write all
 //-----------------------------------------------------------------------------
 int program_drac::spi_write_image(trkdaq::DtcInterface* Dtc_i, int Link, const ImageData_t* Image, int DebugMode) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (!Image) return -1;
+  check_image(Image->fn, Image->offset);
   int rc = 0;
 //-----------------------------------------------------------------------------
 // open input file and determine its size
@@ -893,7 +954,9 @@ int program_drac::spi_write_image(trkdaq::DtcInterface* Dtc_i, int Link, const I
   }
 
   file.seekg(0, std::ios::end);
-  int fsize = file.tellg();
+  const auto fileSize = file.tellg();
+  if (fileSize <= 0 || fileSize > std::numeric_limits<int>::max()) return -1;
+  int fsize = static_cast<int>(fileSize);
   file.seekg(0, std::ios::beg);
 //-----------------------------------------------------------------------------
 // read the input file and upload its content to the SPI memory
@@ -903,7 +966,8 @@ int program_drac::spi_write_image(trkdaq::DtcInterface* Dtc_i, int Link, const I
   int const segment_size(0x10000); // the SPI memory is cleared in 64K segments
 
   std::vector<char> fileData(fsize);
-  file.read((char*) &fileData[0], fsize);
+  file.read(fileData.data(), fsize);
+  if (!file) return -1;
 
   int n64k_segments = (fsize-1)/0x10000 + 1;
 
@@ -935,7 +999,8 @@ int program_drac::spi_write_image(trkdaq::DtcInterface* Dtc_i, int Link, const I
         std::cout << std::format("{}:{}: attempt {} to write segment {:d}\n",__func__,__LINE__,attempt, ib);
       }
 
-      spi_clear_memory(Dtc_i,Link,spi_offset,0x10000,DebugMode);
+      rc = spi_clear_memory(Dtc_i,Link,spi_offset,0x10000,DebugMode);
+      if (rc != 0) return rc;
       rc = spi_write_segment(Dtc_i,Link,data,nb_to_write,spi_offset,DebugMode);
       if (rc != 0) {
                                         // detected error
@@ -1004,6 +1069,7 @@ int program_drac::spi_write_image(trkdaq::DtcInterface* Dtc_i, int Link, const I
 // Version defines one or two images to uploas
 //-----------------------------------------------------------------------------
 int program_drac::spi_write_version(trkdaq::DtcInterface* Dtc_i, int Link, const std::string& Version, int DebugMode) {
+  Dtc_i = programming_target(Dtc_i, Link);
   int rc(0);
                                         // find firmware version
   const FwVersion_t* fw = get_version(Version);
@@ -1026,6 +1092,8 @@ int program_drac::spi_write_version(trkdaq::DtcInterface* Dtc_i, int Link, const
     dtc_i = trkdaq::DtcInterface::Instance(-1);
   }
 
+  check_image(fw->spi_file.fn, fw->spi_file.offset);
+  if (fw->bin_file.load_flag > 0) check_image(fw->bin_file.fn, fw->bin_file.offset);
   gSystem->Setenv("DTCLIB_DTC",Form("%i",dtc_i->PcieAddr()));
 //-----------------------------------------------------------------------------
 // 2. spi directory has always to be mapped in full ,
@@ -1037,13 +1105,14 @@ int program_drac::spi_write_version(trkdaq::DtcInterface* Dtc_i, int Link, const
 
   rc = spi_write_image(dtc_i,Link,&fw->spi_file,DebugMode);
 
-  if (rc < 0) {
+  if (rc != 0) {
     return rc;
   }
 
                                         // upload the .bin image, if needed
   if (fw->bin_file.load_flag > 0) {
-    spi_write_image(dtc_i,Link,&fw->bin_file,DebugMode);
+    rc = spi_write_image(dtc_i,Link,&fw->bin_file,DebugMode);
+    if (rc != 0) return rc;
   }
                                         // activate the image as a separate step after validating
                                         // the memory, thus the following is commented out
@@ -1054,6 +1123,8 @@ int program_drac::spi_write_version(trkdaq::DtcInterface* Dtc_i, int Link, const
 }
 //-----------------------------------------------------------------------------
 int program_drac::spi_validate_version(trkdaq::DtcInterface* Dtc_i, int Link, const std::string& Version, const std::string& Type, int DebugMode) {
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (Type != "" && Type != "spi" && Type != "bin") return -1;
   // find firmware version
   int rc(0);
 
@@ -1080,11 +1151,12 @@ int program_drac::spi_validate_version(trkdaq::DtcInterface* Dtc_i, int Link, co
     rc = spi_validate_image(dtc_i,Link,Version,"spi",DebugMode);
 
                                         // don't proceed in case of any failure
-    if (rc < 0) return rc;
+    if (rc != 0) return rc;
   }
                                         // validate the .bin image, if needed
   if ((Type != "spi") and (fw->bin_file.load_flag > 0)) {
-    spi_validate_image(dtc_i,Link,Version,"bin",DebugMode);
+    rc = spi_validate_image(dtc_i,Link,Version,"bin",DebugMode);
+    if (rc != 0) return rc;
   }
 
   TLOG(TLVL_INFO) << std::format("-- END rc:{}\n",rc);
@@ -1099,7 +1171,7 @@ int program_drac::spi_print_digi_id(const std::vector<uint16_t>& Dat) {
     return -1;
   }
 
-  uint32_t fpga_id = ((uint32_t) Dat[3]) || (((uint32_t) Dat[4]) << 16);
+  uint32_t fpga_id = ((uint32_t) Dat[3]) | (((uint32_t) Dat[4]) << 16);
 
   std::ostringstream oss;
   for (int i=21; i>=6; --i) {
@@ -1134,7 +1206,7 @@ int program_drac::spi_print_digi_info(const std::vector<uint16_t>& Dat) {
     design_name << std::format("{:02x}",(uint8_t) (Dat[i] & 0xff));
   }
 
-  uint32_t checksum = ((uint32_t) Dat[37]) || (((uint32_t) Dat[38]) << 16);
+  uint32_t checksum = ((uint32_t) Dat[37]) | (((uint32_t) Dat[38]) << 16);
   int      design_ver = Dat[39];
   int      back_level = Dat[40];
 
@@ -1165,98 +1237,38 @@ int program_drac::spi_print_digi_info(const std::vector<uint16_t>& Dat) {
 //            bit 4: print formatted
 //-----------------------------------------------------------------------------
 int program_drac::spi_read_digi_id(trkdaq::DtcInterface* Dtc_i, int Link, uint16_t CalHV, int DebugMode) {
-
-  if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
-
-  bool increment_address(false);
-
-  std::vector<uint16_t> input;
-                                        // 2 words
-  input.push_back(CalHV);               //
-  input.push_back(READ_DIGI_ID);        // starting address MSB
-
-  auto roc  = DTCLib::DTC_Link_ID(Link);
-  Dtc_i->fDtc->WriteROCBlock(roc,REG_DIGI,input,false,increment_address,100);
-
-  TLOG(TLVL_INFO) << std::format("-- START: PCIE:{} Link:{} CalHV:{} read_op:{} DebugMode:0x{:08x}",
-                                 Dtc_i->PcieAddr(),Link,CalHV,(int) READ_DIGI_ID,DebugMode);
-  uint16_t u;
-  int ntries(0), kMaxTries(1000);
-  while (((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000) and (ntries < kMaxTries)) {
-    std::this_thread::sleep_for(std::chrono::microseconds(2));
-    ntries++;
-  };
-
-  if (ntries == kMaxTries) {
-    TLOG(TLVL_ERROR) << std::format("no response from ROC after {} tries, r128:0x{:04x}. BAIL OUT",kMaxTries,u);
-    return -1;
-  }
-
-  int nw (-1);
-  nw = Dtc_i->fDtc->ReadROCRegister(roc,129,1000);  // should return NWords+4
-
-  TLOG(TLVL_INFO) << std::format("r129:{}",nw);
-//-----------------------------------------------------------------------------
-// validation: reading back and comparing
-//-----------------------------------------------------------------------------
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (CalHV > 1) return -1;
+  auto roc = DTCLib::DTC_Link_ID(Link);
+  std::vector<uint16_t> input{CalHV, READ_DIGI_ID};
+  Dtc_i->fDtc->WriteROCBlock(roc, REG_DIGI, input, false, false, 1000);
+  uint16_t status = 0;
+  if (wait_register(Dtc_i, Link, 128, 0xffff, 0x8000, 1000, 5000, 10000, status) != 0) return -2;
+  if (wait_register(Dtc_i, Link, 129, 0xffff, 26, 1000, 5000, 10000, status) != 0) return -3;
   std::vector<uint16_t> res;
-  nw -= 4;
-  Dtc_i->fDtc->ReadROCBlock(res,roc,REG_DIGI,nw,false,100);
-
-  if (DebugMode & 0x2) Dtc_i->PrintBuffer(res.data(),nw);
+  Dtc_i->fDtc->ReadROCBlock(res, roc, REG_DIGI, 22, false, 1000);
+  if (res.size() != 22 || res[0] != CalHV || res[1] != READ_DIGI_ID || res[2] != 0) return -4;
+  if (DebugMode & 0x2) Dtc_i->PrintBuffer(res.data(), res.size());
   if (DebugMode & 0x4) spi_print_digi_id(res);
-
-  TLOG(TLVL_INFO) << std::format("-- END: nw:{}",nw);
-  return nw;
+  return 22;
 }
 
 //-----------------------------------------------------------------------------
 int program_drac::spi_read_digi_info(trkdaq::DtcInterface* Dtc_i, int Link, uint16_t CalHV, int DelayUs, int DebugMode) {
-  //  int rc(0);
-
-  if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
-
-  bool increment_address(false);
-
-  std::vector<uint16_t> input;
-
-  input.push_back(CalHV);               //
-  input.push_back(READ_DIGI_INFO);      // operation
-
-  auto roc  = DTCLib::DTC_Link_ID(Link);
-  Dtc_i->fDtc->WriteROCBlock(roc,REG_DIGI,input,false,increment_address,100);
-
-  TLOG(TLVL_INFO) << std::format("-- START: PCIE:{} Link:{} CalHV:{} DelayUs:{} read_op:{} DebugMode:0x{:08x}",
-                                 Dtc_i->PcieAddr(),Link,CalHV,DelayUs,(int) READ_DIGI_INFO,DebugMode);
-  int ntimes(0);
-  uint16_t u;
-  while ((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000) {
-    if (DelayUs > 0) std::this_thread::sleep_for(std::chrono::microseconds(DelayUs));
-
-    ntimes++;
-    if (ntimes > 1000) {
-      TLOG(TLVL_ERROR) << std::format("after ntimes:{} r128:0x{:04x}. BAIL OUT",ntimes,u);
-      return -1;
-    }
-  };
-
-  ntimes = 0;
-  int nw (-1);
-  nw = Dtc_i->fDtc->ReadROCRegister(roc,129,1000);  // should return NWords+4
-
-  TLOG(TLVL_INFO) << std::format("reg 129:{}",nw);
-//-----------------------------------------------------------------------------
-// validation: reading back and comparing .. should read back 153 words
-//-----------------------------------------------------------------------------
+  Dtc_i = programming_target(Dtc_i, Link);
+  if (CalHV > 1) return -1;
+  auto roc = DTCLib::DTC_Link_ID(Link);
+  std::vector<uint16_t> input{CalHV, READ_DIGI_INFO};
+  Dtc_i->fDtc->WriteROCBlock(roc, REG_DIGI, input, false, false, 1000);
+  uint16_t status = 0;
+  if (wait_register(Dtc_i, Link, 128, 0xffff, 0x8000, 1000, 5000, 10000, status) != 0) return -2;
+  if (wait_register(Dtc_i, Link, 129, 0xffff, 157, 1000, 5000, 10000, status) != 0) return -3;
   std::vector<uint16_t> res;
-  nw -= 4;
-  Dtc_i->fDtc->ReadROCBlock(res,roc,REG_DIGI,nw,false,100);
-
-  if (DebugMode & 0x2) Dtc_i->PrintBuffer(res.data(),nw);
+  Dtc_i->fDtc->ReadROCBlock(res, roc, REG_DIGI, 153, false, 1000);
+  if (res.size() != 153 || res[0] != CalHV || res[1] != READ_DIGI_INFO || res[2] != 0) return -4;
+  if (DebugMode & 0x2) Dtc_i->PrintBuffer(res.data(), res.size());
   if (DebugMode & 0x4) spi_print_digi_info(res);
-
-  TLOG(TLVL_INFO) << std::format("-- END: nw:{}",nw);
-  return nw;
+  return 153;
 }
 
 //-----------------------------------------------------------------------------
@@ -1264,144 +1276,56 @@ int program_drac::spi_read_digi_info(trkdaq::DtcInterface* Dtc_i, int Link, uint
 // Fn: "CalV6.dat" or "HVV6.dat" , or smth similar
 //-----------------------------------------------------------------------------
 int program_drac::spi_program_digis(trkdaq::DtcInterface* Dtc_i, int Link, const std::string& Fn, int DebugMode) {
-  int rc(0), kNbReport(100000);
-
-  if (Dtc_i == nullptr) Dtc_i = trkdaq::DtcInterface::Instance(-1);
-//-----------------------------------------------------------------------------
-// read the input file in memory  -- 10 MBytes is nothing
-//-----------------------------------------------------------------------------
-  const std::string spi_directory("/home/mu2etrk/test_stand/spi_files/");
-
-  uint16_t cal_hv;
-
-  std::string ufn = Fn.substr(0,3);
-  boost::algorithm::to_upper(ufn);
-  if (ufn == "CAL") cal_hv = 0;
-  else              cal_hv = 1;
-
-  std::string pq_fn = spi_directory+Fn;
-  std::ifstream file(pq_fn, std::ios::binary);
-
-  if (not file.is_open()) {
-    TLOG(TLVL_ERROR) << std::format("failed to open file:{} . BAIL OUT",Fn);
-    return -1;
-  }
-
-  file.seekg(0, std::ios::end);
-  int fsize = file.tellg();
-  file.seekg(0, std::ios::beg);
-//-----------------------------------------------------------------------------
-// read the input file
-//-----------------------------------------------------------------------------
-  std::vector<char> fileData(fsize);
-  file.read((char*) &fileData[0], fsize);
-  file.close();
-//-----------------------------------------------------------------------------
-// initiate the transaction
-//-----------------------------------------------------------------------------
-  bool increment_address(false);
-
-  std::vector<uint16_t> input;
-  uint16_t op = PROGRAM_DIGI;
-                                        // 2 words
-  input.push_back(cal_hv);              // CAL/HV
-  input.push_back(op);                  // operation code
-//-----------------------------------------------------------------------------
-// starting point
-//-----------------------------------------------------------------------------
-  auto roc  = DTCLib::DTC_Link_ID(Link);
-  Dtc_i->fDtc->WriteROCBlock(roc,REG_DIGI,input,false,increment_address,100);
-
-  TLOG(TLVL_INFO) << std::format("-- START: PCIE:{} Link:{} DebugMode:0x{:04x} fn:{} fsize:{} cal_hv:{} op:{}",
-                                 Dtc_i->PcieAddr(),Link,DebugMode,Fn,fsize,cal_hv,op);
-//-----------------------------------------------------------------------------
-// on return :: 3 words + next_offset , next_nbytes ..(each 2 uint16_t's)
-//-----------------------------------------------------------------------------
-  bool done(false);
-  int nbwr(0), nbwr_tot(0);
-
-  while (not done) {
-//-----------------------------------------------------------------------------
-// check that the previous operation has completed
-// don't remember why sleep's are here
-//-----------------------------------------------------------------------------
-    uint16_t u;
-    int ntries(0), kMaxTries(1000);
-    while (((u = Dtc_i->fDtc->ReadROCRegister(roc,128,1000)) != 0x8000) and (ntries < kMaxTries)) {
-      std::this_thread::sleep_for(std::chrono::microseconds(2));
-      ntries++;
-    };
-
-    if (ntries == kMaxTries) {
-      TLOG(TLVL_ERROR) << std::format("no response from ROC after {} tries. BAIL OUT",kMaxTries);
-      return -2;
-    }
-//-----------------------------------------------------------------------------
-// expect reg 129 to return nw=8
-//-----------------------------------------------------------------------------
-    int nw (-1), ntimes(0);
-    while ((nw = Dtc_i->fDtc->ReadROCRegister(roc,129,1000)) != 8) {
-      std::this_thread::sleep_for(std::chrono::microseconds(2));
-      TLOG(TLVL_WARNING) << std::format("attempt:{} reg 129 nw:{}",ntimes,nw);
-      ntimes++;
-      if (ntimes > 0) { //  100) {
-        TLOG(TLVL_ERROR) << std::format("after ntimes:{} nw:{}. BAIL OUT",ntimes,nw);
-        rc = -3;
-        break;
-      }
-    }
-    if (rc < 0) break;
-//-----------------------------------------------------------------------------
-// reading back the offset and the number of bytes
-// at this point, nw = 8 (check for that!)
-//-----------------------------------------------------------------------------
+  Dtc_i = programming_target(Dtc_i, Link);
+  const std::filesystem::path name(Fn);
+  if (name.empty() || name.has_parent_path() || name.extension() != ".dat") return -1;
+  std::string prefix=Fn.substr(0,3);
+  boost::algorithm::to_upper(prefix);
+  uint16_t calHV=0;
+  if (prefix == "CAL") calHV=0;
+  else if (prefix.starts_with("HV")) calHV=1;
+  else return -1; // Never silently route an unknown filename to HV.
+  const auto path = std::filesystem::path("/home/mu2etrk/test_stand/spi_files") / name;
+  check_image(path.string(),0);
+  std::ifstream file(path,std::ios::binary | std::ios::ate);
+  const auto size=file.tellg();
+  if (size <= 0 || size > std::numeric_limits<int>::max()) return -1;
+  std::vector<char> fileData(static_cast<size_t>(size));
+  file.seekg(0);
+  if (!file.read(fileData.data(),fileData.size())) return -1;
+  const auto roc=DTCLib::DTC_Link_ID(Link);
+  std::vector<uint16_t> input{calHV,PROGRAM_DIGI};
+  TLOG(TLVL_INFO) << std::format("DTC:{} ROC:{} programming DIGI target:{} file:{} bytes:{}",
+                                 Dtc_i->PcieAddr(),Link,calHV,path.string(),fileData.size());
+  Dtc_i->fDtc->WriteROCBlock(roc,REG_DIGI,input,false,false,1000);
+  // More than one request per file byte indicates a stalled/repeating transfer.
+  for (size_t pass=0;pass<=fileData.size();++pass) {
+    uint16_t status=0;
+    if (wait_register(Dtc_i,Link,128,0xffff,0x8000,1000,5000,10000,status) != 0) return -2;
+    if (wait_register(Dtc_i,Link,129,0x1000,0,1000,5000,10000,status) != 0) return -3;
+    if (wait_register(Dtc_i,Link,129,0xffff,8,1000,5000,10000,status) != 0) return -4;
     std::vector<uint16_t> res;
-    nw -= 4;
-    Dtc_i->fDtc->ReadROCBlock(res,roc,REG_DIGI,nw,false,100);
-    int next_offset = int(res[0]) + (int)(res[1]<<16);
-    int next_nbytes = int(res[2]) + (int)(res[3]<<16);
-
-    if (nbwr >= kNbReport) {
-      TLOG(TLVL_INFO) << std::format("nbwr_tot:{:10d} last_nbwr:{:6d} next_offset:0x{:08x} next_nbytes:{}",nbwr_tot,nbwr,next_offset,next_nbytes);
-      nbwr = 0;
-    }
-//--------------------------------------------------
-// normal exit in case of success
-//-----------------------------------------------------------------------------
-    if (next_offset + next_nbytes == 0)                     break;
-//-----------------------------------------------------------------------------
-// not everything has been written, form input and store it in a vector 'input'
-//-----------------------------------------------------------------------------
-    input.clear();
-
-    for (int i=0; i<next_nbytes; i+=2) {
-      int      loc = next_offset+i;
-      uint16_t w16 = (fileData[loc] & 0xff);
-      TLOG(TLVL_DEBUG+1) << std::format("(1) i:{:5} loc:0x{:08x} next_nbytes:{:5} w16:0x{:04x}",i,loc,next_nbytes,w16);
-      if (i < next_nbytes-1) {
-        uint16_t bb = (fileData[loc+1] & 0xff);
-        w16 = w16 | (bb << 8);
-        TLOG(TLVL_DEBUG+1) << std::format("bb:0x{:04x} w16:0x{:04x}",bb,w16);
-      }
-      input.push_back(w16);
-    }
-
-    Dtc_i->fDtc->WriteROCBlock(roc,REG_DIGI,input,false,increment_address,100);
-
-    nbwr     += next_nbytes;
-    nbwr_tot += next_nbytes;
-
-    if (DebugMode & 0x8) {
-      Dtc_i->PrintBuffer(input.data(),input.size());
-    }
+    Dtc_i->fDtc->ReadROCBlock(res,roc,REG_DIGI,4,false,1000);
+    if (res.size() != 4) return -5;
+    const uint32_t offset=uint32_t(res[0]) | (uint32_t(res[1])<<16);
+    const uint32_t count=uint32_t(res[2]) | (uint32_t(res[3])<<16);
+    if (offset == 0 && count == 0) return 0;
+    if (count == 0 || offset > fileData.size() || count > fileData.size()-offset) return -5;
+    input.assign((size_t(count)+1)/2,0);
+    for (size_t i=0;i<count;++i)
+      input[i/2] |= uint16_t(static_cast<unsigned char>(fileData[size_t(offset)+i])) << (8*(i%2));
+    TLOG(TLVL_DEBUG+1) << std::format("DTC:{} ROC:{} pass:{} offset:0x{:08x} bytes:{}",
+                                     Dtc_i->PcieAddr(),Link,pass,offset,count);
+    if (DebugMode & 0x8) Dtc_i->PrintBuffer(input.data(),input.size());
+    Dtc_i->fDtc->WriteROCBlock(roc,REG_DIGI,input,false,false,1000);
   }
-
-  TLOG(TLVL_INFO) << std::format("-- END: nbwr_tot:{:10d} last_nbwr:{:6d}",nbwr_tot,nbwr);
-  return rc;
+  TLOG(TLVL_ERROR) << "DIGI transfer exceeded request budget without completion";
+  return -6;
 }
 
 //-----------------------------------------------------------------------------
 int program_drac::test_spi_write_record(trkdaq::DtcInterface* Dtc_i, int Link, int FirstAddr, int NWords, int DelayUs) {
+  Dtc_i = programming_target(Dtc_i, Link);
   int rc(0);
 
   trkdaq::DtcInterface* dtc_i = Dtc_i;
@@ -1423,7 +1347,7 @@ int program_drac::test_spi_write_record(trkdaq::DtcInterface* Dtc_i, int Link, i
   // spi_clear_memory(Dtc_i, Link, FirstAddr,0x1000);
   // rc = spi_clear_memory(Dtc_i, Link, FirstAddr,0x10000);
 
-  if (rc < 0) {
+  if (rc != 0) {
                                         // the diagnostics printed in the function where the error was first detected
     return -1;
   }
@@ -1451,6 +1375,7 @@ int program_drac::test_spi_write_record(trkdaq::DtcInterface* Dtc_i, int Link, i
 
 //-----------------------------------------------------------------------------
 int program_drac::test_spi_read_record(trkdaq::DtcInterface* Dtc_i, int Link, int FirstAddr, int NWords) {
+  Dtc_i = programming_target(Dtc_i, Link);
 
   trkdaq::DtcInterface* dtc_i = Dtc_i;
   if (dtc_i == nullptr) {
@@ -1475,12 +1400,15 @@ void program_drac::test_read_file(const char* Fn) {
   std::ifstream file(Fn, std::ios::binary);
 
   file.seekg(0, std::ios::end);
-  int fsize = file.tellg();
+  const auto fileSize = file.tellg();
+  if (fileSize <= 0 || fileSize > std::numeric_limits<int>::max()) throw std::runtime_error("Invalid or incomplete image file");
+  int fsize = static_cast<int>(fileSize);
 
   std::cout << "fsize:" << fsize << std::endl;
   file.seekg(0, std::ios::beg);
 
   std::vector<char> fileData(fsize);
-  file.read((char*) &fileData[0], fsize);
+  file.read(fileData.data(), fsize);
+  if (!file) throw std::runtime_error("Invalid or incomplete image file");
   file.close();
 }

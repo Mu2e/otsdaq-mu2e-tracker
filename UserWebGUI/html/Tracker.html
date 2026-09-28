@@ -1,6 +1,7 @@
 <!DOCTYPE HTML>
 <html lang="en">
 <head>
+	<meta charset="UTF-8">
 	<title>Tracker Controls</title>
 
 	<link href="/WebPath/css/fonts.css?family=Inconsolata:400" rel="stylesheet" type="text/css">
@@ -14,6 +15,20 @@
 	<script type="text/JavaScript" src="/WebPath/js/js_lib/ConfigurationAPI.js"></script>
 	<script type="text/JavaScript" src="/WebPath/UserWebPath/js/Mu2e.js"></script>
 	<script type="text/JavaScript" src="../js/TrackerHardware.js"></script>
+	<style>
+		.tracker-counters-scroll { overflow-x: auto; margin: 6px 0 16px; }
+		.tracker-counters-table { border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+		.tracker-counters-table th, .tracker-counters-table td { border: 1px solid #b7cadb; padding: 5px 8px; }
+		.tracker-counters-table thead th { background: #eaf2fa; color: #194b75; text-align: center; }
+		.tracker-counters-table tbody th { text-align: left; font-weight: normal; }
+		.tracker-counters-table td { text-align: right; font-variant-numeric: tabular-nums; }
+		.tracker-counters-table .counter-dtc-start { border-left: 2px solid #668aac; }
+		.tracker-counters-table .counter-disabled { background: #ededed; color: #777; }
+		.tracker-counters-table .counter-mismatch { background: #fff0f1; color: #b00020; font-weight: bold; }
+		.tracker-counter-note { margin: 3px 0; }
+		.settings-table td.settings-value.rate-masked { background: #e0e0e0; color: #666; }
+		.settings-table td.settings-value.rate-high { background: #ffd6d6; color: #a40000; font-weight: bold; }
+	</style>
 
 	<script>
 		var _structureReady = false;
@@ -24,9 +39,12 @@
 		var _macroRunTarget = null;
 		var _activeMacroName = null;
 		var _globalGeneration = 0;
+		var _globalBusy = false;
+		var _thresholdFormDTC = null;
 		var _globalTargets = [];
 		var _globalResults = [];
 		var _globalCompletedTargets = {};
+		var _globalCounterLinks = {};
 		var _dtcCommandState = {};
 		var _outputEntrySequence = 0;
 		var ACTION_BUTTON_LIMIT = 8;
@@ -213,8 +231,13 @@
 			return true;
 		}
 
-		function commandSucceeded(macroName, result) {
+		function commandSucceeded(macroName, result, counterLinks) {
 			if (!result || result.error) return false;
+			if (macroName === "ROC FEMacro - Find and serialize thresholds")
+				return Mu2eHardware.thresholdScanSucceeded(result);
+			if (macroName === "Get DTC Counters")
+				return counterLinks ? Mu2eHardware.checkDTCCounters(result, counterLinks).success :
+					Mu2eHardware.parseDTCCounters(result).errors.length === 0;
 			if (/Get Link Lock Status$/i.test(macroName || ""))
 				return enabledROCLinksLocked(result);
 			if (/Reset Counters$/i.test(macroName || ""))
@@ -267,6 +290,16 @@
 			if (!deferRender) renderDTCGrid();
 		}
 
+		function dtcThresholdTargets(uid) {
+			if (typeof uid !== "string" || !/^Trk\d+_DTC\d+$/i.test(uid))
+				throw new Error("Invalid tracker DTC.");
+			var included = Mu2eHardware.getIncludedTrackerDTCs();
+			return trackerDTCs().filter(function (dtc) {
+				return dtc.name === uid && dtc.enabled && included.indexOf(uid) >= 0 &&
+					Mu2eHardware.getROCsForDTC(uid).some(function (roc) { return roc.enabled; });
+			}).map(function (dtc) { return dtc.name; });
+		}
+
 		function renderDTCGrid() {
 			var dtcs = trackerDTCs();
 			var html = "";
@@ -295,7 +328,7 @@
 				html += "<span class='status-dot " + dotClass + "' title='" +
 					escapeHTML(dotTitle) + "'></span>";
 				html += "<span class='tracker-dtc-name'>" + escapeHTML(dtc.name) + "</span>";
-				html += "<span class='tracker-expand-symbol'>" + (open ? "−" : "+") + "</span>";
+				html += "<span class='tracker-expand-symbol'>" + (open ? "&minus;" : "+") + "</span>";
 				html += "</button>";
 
 				if (open) {
@@ -428,6 +461,10 @@
 
 			var html = "<div class='macro-input-form'><b>" +
 				escapeHTML(Mu2eHardware.macroDisplayName(macroName)) + "</b>";
+			if (macroName === "ROC FEMacro - Find and serialize thresholds")
+				html += "<p>Tolerance must be positive. Leave Filesystem path blank to save where Set Thresholds loads from, " +
+					"or enter an absolute root directory: root/slot_XX/thresholds-YY-mV/MNxxx.json, where YY is the requested threshold. " +
+					"One file is saved per panel; existing files get .bak copies.</p>";
 			for (var i = 0; i < prepared.remaining.length; ++i) {
 				var inputName = prepared.remaining[i];
 				html += "<div class='macro-input-row'><label>" +
@@ -456,6 +493,9 @@
 			if (macroName === "DTC Soft Reset") return "";
 			if (macroName === "ROC FEMacro - Write DIGI Register")
 				return "";
+			if (macroName === "ROC FEMacro - Find and serialize thresholds")
+				return "Adjust CAL/HV threshold DACs on " + _selectedUID +
+					" and save per-panel JSON files? Existing files get .bak copies. Data taking must be stopped.";
 			if (macroName === "ROC FEMacro - Deserialize and set thresholds")
 				return "Program configured thresholds on " + _selectedUID +
 					"?\n\nThis writes all configured Cal and HV threshold DACs. " +
@@ -473,6 +513,8 @@
 			var inputPanel = document.getElementById("selectionInputs");
 			if (inputPanel) inputPanel.innerHTML = "";
 			var stateDTC = _macroRunTarget.dtcUID || _macroRunTarget.uid;
+			var selectedUID = _selectedUID;
+			var reportUnit = _macroRunTarget.linkIndex >= 0 ? "ROC" : "DTC";
 			beginDTCCommand(stateDTC);
 			updateOutputEntry(outputEntryId, "<div class='tracker-running'>Running <b>" +
 				escapeHTML(Mu2eHardware.macroDisplayName(macroName)) +
@@ -480,9 +522,13 @@
 
 			Mu2eHardware.runMacro(_macroRunTarget.uid, macroName, inputs,
 				function (result) {
-					finishDTCCommand(stateDTC, commandSucceeded(macroName, result));
-					updateOutputEntry(outputEntryId, Mu2eHardware.formatMacroResult(
-						macroName, result, _selectedUID));
+					var success = commandSucceeded(macroName, result);
+					finishDTCCommand(stateDTC, success);
+					var summary = /(?:Init Readout|Preflight)$/i.test(macroName) ?
+						renderFailureSummary(Mu2eHardware.macroDisplayName(macroName),
+							1, 1, success ? 0 : 1, true, reportUnit) : "";
+					updateOutputEntry(outputEntryId, summary + Mu2eHardware.formatMacroResult(
+						macroName, result, selectedUID));
 				},
 				function (progress) {
 					if (!progress || !progress.length) return;
@@ -493,6 +539,12 @@
 		}
 
 		var GLOBAL_ACTIONS = {
+			"counters": {
+				label: "Counters", macro: "Get DTC Counters", inputs: {}, counters: true
+			},
+			"status": {
+				label: "Status", status: true
+			},
 			"preflight": {
 				label: "Preflight", macro: "ROC FEMacro - Preflight", allROCs: true,
 				preflight: true
@@ -514,6 +566,10 @@
 				label: "Find Alignment", macro: "ROC FEMacro - Find Alignment",
 				allROCs: true
 			},
+			"find-save-thresholds": {
+				label: "Find & Save Thresholds", macro: "ROC FEMacro - Find and serialize thresholds",
+				allROCs: true, thresholdScan: true
+			},
 			"set-thresholds": {
 				label: "Set Thresholds", macro: "ROC FEMacro - Deserialize and set thresholds",
 				allROCs: true, validateOnly: false,
@@ -525,7 +581,7 @@
 		function renderGlobalActions() {
 			var el = document.getElementById("globalActions");
 			var allowed = Mu2eHardware.ALL_TRACKER_BUTTON_ALLOWLIST ||
-				["preflight", "init-readout", "link-status", "read-panel-id", "reset-counters", "find-alignment", "set-thresholds"];
+				["counters", "status", "preflight", "init-readout", "link-status", "read-panel-id", "reset-counters", "find-alignment", "set-thresholds", "find-save-thresholds"];
 			var available = [];
 			for (var i = 0; i < allowed.length; ++i)
 				if (GLOBAL_ACTIONS[allowed[i]]) available.push(allowed[i]);
@@ -543,16 +599,57 @@
 		}
 
 		function setGlobalDisabled(disabled) {
+			_globalBusy = disabled;
+			renderDTCGrid();
 			var buttons = document.querySelectorAll("#globalActions button");
 			for (var i = 0; i < buttons.length; ++i) buttons[i].disabled = disabled;
 		}
 
+		function renderFailureSummary(label, total, completed, failed, complete, unit) {
+			unit = unit || "DTC";
+			var pending = Math.max(0, total - completed);
+			return "<div class='batch-summary tracker-failure-summary' role='status'>" +
+				"<b>" + escapeHTML(label) + "</b>: " +
+				"<strong style='color:" + (failed ? "#b00020" : "#18783b") + "'>" +
+				failed + " " + unit + (failed === 1 ? "" : "s") + " failed</strong>" +
+				" &middot; " + (completed - failed) + " passed" +
+				(pending ? " &middot; " + pending + " pending" : "") +
+				"<br>" + completed + " / " + total + " " + unit +
+				(total === 1 ? "" : "s") + " complete" +
+				(complete ? "." : "...") + "</div>";
+		}
+
 		function renderGlobalResults(action, complete, outputEntryId) {
+			var results = _globalResults.slice();
+			if (complete) {
+				var reported = {};
+				for (var r = 0; r < results.length; ++r) reported[results[r].uid] = true;
+				for (var t = 0; t < _globalTargets.length; ++t)
+					if (!reported[_globalTargets[t]])
+						results.push({uid: _globalTargets[t], result: {error: "No response received"}});
+			}
+			if (action.counters) {
+				var counterFailures = results.filter(function (item) {
+					return !commandSucceeded(action.macro, item.result, _globalCounterLinks[item.uid]);
+				}).length;
+				updateOutputEntry(outputEntryId,
+					renderFailureSummary("Counters", _globalTargets.length, results.length,
+						counterFailures, complete) +
+					Mu2eHardware.formatTrackerCounters(_globalTargets, results, complete, _globalCounterLinks));
+				return;
+			}
 			var html = "<div class='batch-summary'><b>" + escapeHTML(action.label) +
-				"</b>: " + _globalResults.length + " / " + _globalTargets.length +
+				"</b>: " + results.length + " / " + _globalTargets.length +
 				" DTCs complete" + (complete ? "." : "...") + "</div>";
-			for (var i = 0; i < _globalResults.length; ++i) {
-				var item = _globalResults[i];
+			if (action.thresholdScan || /(?:Init Readout|Preflight)$/i.test(action.macro)) {
+				var failed = 0;
+				for (var f = 0; f < results.length; ++f)
+					if (!commandSucceeded(action.macro, results[f].result)) ++failed;
+				html = renderFailureSummary(action.label, _globalTargets.length,
+					results.length, failed, complete);
+			}
+			for (var i = 0; i < results.length; ++i) {
+				var item = results[i];
 				var success = commandSucceeded(action.macro, item.result);
 				html += "<details class='dtc-report " +
 					(success ? "dtc-report-pass" : "dtc-report-fail") + "'>";
@@ -572,9 +669,11 @@
 		}
 
 		function renderPreflightResults(complete, outputEntryId, stage) {
-			var html = "<div class='batch-summary'><b>Preflight</b>: " +
-				_globalResults.length + " / " + _globalTargets.length +
-				" DTCs complete" + (complete ? "." : "...") + "</div>";
+			var failed = 0;
+			for (var f = 0; f < _globalResults.length; ++f)
+				if (!preflightItemSucceeded(_globalResults[f])) ++failed;
+			var html = renderFailureSummary("Preflight", _globalTargets.length,
+				_globalResults.length, failed, complete);
 			if (stage)
 				html += "<div class='tracker-running'>" + escapeHTML(stage) + "</div>";
 
@@ -641,13 +740,202 @@
 				});
 		}
 
-		function runGlobalAction(key) {
+		// Status deliberately reads only these registers, not the Preflight counters.
+		var STATUS_CHECKS = [
+			{label: "DTC BatchSlip = 0", macro: "Get RTF Interface Status", inputs: {}},
+			{label: "ROC R18 = 0x0F00", macro: "ROC FEMacro - Read Register",
+				inputs: {Address: "18"}, expected: 0x0F00, mask: 0xFFFF},
+			{label: "CAL DIGI 0xC0 low 10 bits = 0x047", macro: "ROC FEMacro - Read DIGI Register",
+				inputs: {Address: "192", HvCal: "1"}, expected: 0x047, mask: 0x03FF, returnCode: true},
+			{label: "HV DIGI 0xC0 low 10 bits = 0x047", macro: "ROC FEMacro - Read DIGI Register",
+				inputs: {Address: "192", HvCal: "2"}, expected: 0x047, mask: 0x03FF, returnCode: true}
+		];
+
+		function statusNumericValues(value) {
+			if (value === undefined || value === null || String(value).trim() === "") return null;
+			try {
+				var values = JSON.parse(String(value));
+				if (!Array.isArray(values)) values = [values];
+				if (!values.length || !values.every(function (v) { return Number.isInteger(v); }))
+					return null;
+				return values;
+			} catch (e) { return null; }
+		}
+
+		function statusCheckSucceeded(check, result) {
+			if (!result || result.error) return false;
+			if (check.expected === undefined) {
+				var batchSlip = batchSlipResult(result);
+				return batchSlip.found && batchSlip.value === 0;
+			}
+			var targets = result.targets || [];
+			if (!targets.length) return false;
+			for (var t = 0; t < targets.length; ++t) {
+				var outputs = targets[t].outputs || {};
+				var links = statusNumericValues(outputs["Target ROC"]);
+				var values = statusNumericValues(outputs.Value);
+				if (!links || !values || links.length !== values.length) return false;
+				var codes = check.returnCode ? statusNumericValues(outputs["Return code"]) : null;
+				if (check.returnCode && (!codes || codes.length !== links.length)) return false;
+				for (var r = 0; r < links.length; ++r) {
+					if (links[r] < 0 || links[r] > 5 || links.indexOf(links[r]) !== r) return false;
+					if (values[r] < 0 || values[r] > 0xFFFFFFFF ||
+						(values[r] & check.mask) !== check.expected) return false;
+					if (codes && codes[r] !== 0) return false;
+				}
+			}
+			return true;
+		}
+
+		function statusItemSucceeded(item) {
+			return item.checks.length === STATUS_CHECKS.length &&
+				item.checks.every(function (check) { return check.success; });
+		}
+
+		function formatStatusReadResult(check, uid) {
+			var result = check.result;
+			if (check.definition.expected !== undefined && result && !result.error) {
+				result = Object.assign({}, result, {targets: (result.targets || []).map(function (target) {
+					var outputs = Object.assign({}, target.outputs);
+					var values = statusNumericValues(outputs.Value);
+					if (values) outputs.Value = values.map(function (value) {
+						return "0x" + value.toString(16).toUpperCase().padStart(4, "0");
+					}).join(", ");
+					return Object.assign({}, target, {outputs: outputs});
+				})});
+			}
+			return Mu2eHardware.formatMacroResult(check.definition.macro, result, uid);
+		}
+
+		function renderStatusResults(complete, outputEntryId, stage) {
+			var failed = _globalResults.filter(function (item) { return !statusItemSucceeded(item); }).length;
+			var html = renderFailureSummary("Status", _globalTargets.length,
+				_globalResults.length, failed, complete);
+			if (stage) html += "<div class='tracker-running'>" + escapeHTML(stage) + "</div>";
+			for (var i = 0; i < _globalResults.length; ++i) {
+				var item = _globalResults[i];
+				var success = statusItemSucceeded(item);
+				html += "<details class='dtc-report " + (success ? "dtc-report-pass" : "dtc-report-fail") + "'>";
+				html += "<summary><span>" + escapeHTML(item.uid) + "</span><span>" +
+					(success ? "PASS" : "FAIL") + "</span></summary><div class='dtc-report-body'>";
+				for (var c = 0; c < item.checks.length; ++c) {
+					var check = item.checks[c];
+					html += "<div><strong class='" + (check.success ? "goodValue" : "badValue") + "'>" +
+						(check.success ? "PASS: " : "FAIL: ") + escapeHTML(check.definition.label) + "</strong></div>";
+					html += formatStatusReadResult(check, item.uid);
+				}
+				html += "</div></details>";
+			}
+			updateOutputEntry(outputEntryId, html);
+		}
+
+		function runGlobalStatus(outputEntryId, generation) {
+			var items = {};
+			var targets = _globalTargets.slice();
+			for (var i = 0; i < targets.length; ++i) items[targets[i]] = {uid: targets[i], checks: []};
+			function runCheck(index) {
+				if (generation !== _globalGeneration) return;
+				if (index === STATUS_CHECKS.length) {
+					_globalResults = targets.map(function (uid) { return items[uid]; });
+					for (var t = 0; t < targets.length; ++t)
+						finishDTCCommand(targets[t], statusItemSucceeded(items[targets[t]]), true);
+					renderDTCGrid();
+					renderStatusResults(true, outputEntryId, "");
+					setGlobalDisabled(false);
+					return;
+				}
+				var check = STATUS_CHECKS[index];
+				renderStatusResults(false, outputEntryId, "Checking " + check.label + "...");
+				Mu2eHardware.runMacroOnUIDs(targets, check.macro,
+					function (uid) {
+						var inputs = check.expected === undefined ? {} : Mu2eHardware.getAllROCInputs(uid, check.macro);
+						if (inputs === null) return null;
+						Object.keys(check.inputs).forEach(function (key) { inputs[key] = check.inputs[key]; });
+						return inputs;
+					},
+					function (results) {
+						if (generation !== _globalGeneration) return;
+						var byUID = {};
+						(results || []).forEach(function (item) { byUID[item.uid] = item.result; });
+						targets.forEach(function (uid) {
+							var result = byUID[uid] || {error: "No response received"};
+							items[uid].checks.push({definition: check, result: result,
+								success: statusCheckSucceeded(check, result)});
+						});
+						runCheck(index + 1);
+					});
+			}
+			runCheck(0);
+		}
+
+		function showGlobalThresholdForm(dtcUID) {
+			_thresholdFormDTC = dtcUID == null ? null : dtcUID;
+			var targets = dtcUID == null ? null : dtcThresholdTargets(dtcUID);
+			var scope = dtcUID == null ? "the tracker" : dtcUID;
+			var panel = document.getElementById("globalInputs");
+			panel.innerHTML = "<div class='macro-input-form'><b>Find &amp; Save Thresholds — " + escapeHTML(scope) + "</b>" +
+				(targets ? "<p>Target DTCs: " + escapeHTML(targets.join(", ") || "None enabled") + "</p>" : "") +
+				"<p>Adjust all 96 CAL and HV thresholds on enabled ROCs in " + escapeHTML(scope) + ". " +
+				"Stop data taking first. DAC settings remain changed after the search.</p>" +
+				"<div class='macro-input-row'><label for='globalThreshold'>Threshold (mV), signed:</label>" +
+				"<input id='globalThreshold' type='number' step='any'></div>" +
+				"<div class='macro-input-row'><label for='globalTolerance'>Tolerance (mV):</label>" +
+				"<input id='globalTolerance' type='number' step='any'></div>" +
+				"<div class='macro-input-row'><label for='globalThresholdDirectory'>Output root directory (optional):</label>" +
+				"<input id='globalThresholdDirectory' type='text' placeholder='Blank: configured threshold paths'></div>" +
+				"<p>Blank uses ThresholdRoot/slot_XX/ThresholdSet/MNxxx.json, matching Set Thresholds. " +
+				"An override root writes slot_XX/thresholds-YY-mV/MNxxx.json beneath it, where YY is the requested threshold. " +
+				"Existing files get a .bak copy; " +
+				"failed panel searches do not replace their files.</p>" +
+				"<div id='globalThresholdError' class='badValue'></div>" +
+				"<button class='macro-run-btn' type='button' onclick='runGlobalThresholdForm()'>Run on enabled ROCs in " + escapeHTML(scope) + "</button></div>";
+			if (panel.scrollIntoView) panel.scrollIntoView({block: "nearest"});
+		}
+
+		function runGlobalThresholdForm() {
+			try {
+				var settings = Mu2eHardware.thresholdScanSettings(
+					document.getElementById("globalThreshold").value,
+					document.getElementById("globalTolerance").value,
+					document.getElementById("globalThresholdDirectory").value);
+				runGlobalAction("find-save-thresholds", settings, _thresholdFormDTC);
+			} catch (e) {
+				document.getElementById("globalThresholdError").textContent = e.message;
+			}
+		}
+
+		function runGlobalAction(key, thresholdSettings, dtcUID) {
+			if (_globalBusy) return;
 			var action = GLOBAL_ACTIONS[key];
 			if (!action) return;
+			var thresholdTargets, thresholdInputs;
+			if (action.thresholdScan) {
+				if (!thresholdSettings) { showGlobalThresholdForm(dtcUID); return; }
+				thresholdTargets = dtcUID == null ? Mu2eHardware.getIncludedTrackerDTCs() : dtcThresholdTargets(dtcUID);
+				var scope = dtcUID == null ? "the tracker" : dtcUID;
+				if (dtcUID != null) action = Object.assign({}, action, {label: action.label + " — " + dtcUID});
+				thresholdInputs = {};
+				if (!thresholdTargets.length) throw new Error("No enabled DTCs with enabled ROCs found in " + scope + ".");
+				thresholdTargets.forEach(function (uid) {
+					thresholdInputs[uid] = Mu2eHardware.thresholdScanInputs(uid, thresholdSettings);
+				});
+				if (!window.confirm("Find and save thresholds on enabled ROCs across " + thresholdTargets.length +
+					" DTCs in " + scope + "?\nTarget DTCs: " + thresholdTargets.join(", ") +
+					"\n\nThreshold: " + thresholdSettings["Threshold (mV)"] +
+					" mV; tolerance: " + thresholdSettings["Tolerance (mV)"] + " mV.\nDestination: " +
+					(thresholdSettings["Filesystem path"] ?
+						thresholdSettings["Filesystem path"].replace(/\/+$/, "") +
+						"/slot_XX/thresholds-" + thresholdSettings["Threshold (mV)"] + "-mV/MNxxx.json" :
+						"configured ThresholdRoot/slot_XX/ThresholdSet/MNxxx.json") +
+					"\nThis changes CAL/HV DACs and replaces successful panels' files, retaining .bak copies. " +
+					"It is not atomic across the selected panels. Data taking must be stopped.")) return;
+				document.getElementById("globalInputs").innerHTML = "";
+			}
 			if (action.confirm && !window.confirm(action.confirm)) return;
 			var outputEntryId = createOutputEntry();
 			var generation = ++_globalGeneration;
-			_globalTargets = Mu2eHardware.getIncludedTrackerDTCs();
+			_globalTargets = thresholdTargets || Mu2eHardware.getIncludedTrackerDTCs();
+			_globalCounterLinks = action.counters ? Mu2eHardware.snapshotCounterLinks(_globalTargets) : {};
 			_globalResults = [];
 			_globalCompletedTargets = {};
 			if (!_globalTargets.length) {
@@ -659,6 +947,10 @@
 				beginDTCCommand(_globalTargets[targetIndex], true);
 			renderDTCGrid();
 			setGlobalDisabled(true);
+			if (action.status) {
+				runGlobalStatus(outputEntryId, generation);
+				return;
+			}
 			if (action.preflight) {
 				runGlobalPreflight(action, outputEntryId, generation);
 				return;
@@ -667,6 +959,7 @@
 
 			Mu2eHardware.runMacroOnUIDs(_globalTargets, action.macro,
 				function (uid) {
+					if (action.thresholdScan) return thresholdInputs[uid];
 					var inputs = action.inputs || {};
 					if (action.allROCs) {
 						inputs = Mu2eHardware.getAllROCInputs(uid, action.macro);
@@ -682,7 +975,7 @@
 						var completedResult = results[resultIndex];
 						if (!_globalCompletedTargets[completedResult.uid]) {
 							finishDTCCommand(completedResult.uid,
-								commandSucceeded(action.macro, completedResult.result), true);
+								commandSucceeded(action.macro, completedResult.result, _globalCounterLinks[completedResult.uid]), true);
 							_globalCompletedTargets[completedResult.uid] = true;
 						}
 					}
@@ -701,7 +994,7 @@
 				function (uid, result) {
 					if (generation !== _globalGeneration) return;
 					if (!_globalCompletedTargets[uid]) {
-						finishDTCCommand(uid, commandSucceeded(action.macro, result));
+						finishDTCCommand(uid, commandSucceeded(action.macro, result, _globalCounterLinks[uid]));
 						_globalCompletedTargets[uid] = true;
 					}
 					_globalResults.push({uid: uid, result: result});
@@ -723,6 +1016,7 @@
 
 		<section class="tracker-global-section">
 			<div id="globalActions" class="global-actions-bar"></div>
+			<div id="globalInputs"></div>
 		</section>
 
 		<section class="tracker-command-section">

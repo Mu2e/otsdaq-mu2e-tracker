@@ -1,5 +1,8 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdlib>
+#include <unistd.h>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -15,7 +18,6 @@ using namespace ots;
 #undef __MF_SUBJECT__
 #define __MF_SUBJECT__ "FE-ROCTrackerInterface"
 
-std::mutex ROCTrackerInterface::_json_filesystem_mutex;
 
 ROCTrackerInterface::ROCTrackerInterface(
     const std::string&       rocUID,
@@ -172,6 +174,8 @@ ROCTrackerInterface::ROCTrackerInterface(
 	    std::vector<std::string>{},
 	    std::vector<std::string>{"Return code",
 	                             "ROC FIFO status",
+	                             "ROC enabled lanes",
+	                             "ROC alignment 0xB6",
 	                             "CAL DIGI 0xA4",
 	                             "HV DIGI 0xA4",
 	                             "CAL DIGI 0xA5",
@@ -189,8 +193,9 @@ ROCTrackerInterface::ROCTrackerInterface(
 	                             "Checks"},
 	    1,
 	    "Read-only preflight for this ROC. Requires ROC register 18 to be "
-	    "0x0F00; requires CAL and HV DIGI register 0xC0 low 10 bits to be "
-	    "0x047; and requires DIGI registers 0xA4, 0xA5, 0xA6, 0xD0, 0xD1, "
+	    "0x0F00 and internal ROC register 0xB6 to report alignment for every "
+	    "lane enabled in register 8; requires CAL and HV DIGI register 0xC0 "
+	    "low 10 bits to be 0x047; and requires DIGI registers 0xA4, 0xA5, 0xA6, 0xD0, 0xD1, "
 	    "and 0xD2 to be zero. Returns every CAL and HV DIGI value read.");
 
 	registerFEMacroFunction("Write DIGI Register",
@@ -233,7 +238,7 @@ ROCTrackerInterface::ROCTrackerInterface(
 	    static_cast<FEVInterface::frontEndMacroFunction_t>(
 	        &ROCTrackerInterface::FindThreshold),
 	    std::vector<std::string>{"Channel", "Preamp", "Threshold (mV)", "Tolerance (mV)"},
-	    std::vector<std::string>{"Success", "DAC value"},
+	    std::vector<std::string>{"Success", "DAC value", "Threshold diagnostics"},
 	    1,
 	    "" /* tooltip info here */);
 
@@ -241,7 +246,7 @@ ROCTrackerInterface::ROCTrackerInterface(
 	                        static_cast<FEVInterface::frontEndMacroFunction_t>(
 	                            &ROCTrackerInterface::FindThresholds),
 	                        std::vector<std::string>{"Threshold (mV)", "Tolerance (mV)"},
-	                        std::vector<std::string>{"Failed count", "DAC values"},
+	                        std::vector<std::string>{"Summary", "Failed count", "DAC values", "Threshold diagnostics"},
 	                        1,
 	                        "" /* tooltip info here */);
 
@@ -342,8 +347,8 @@ ROCTrackerInterface::ROCTrackerInterface(
   registerFEMacroFunction("Measure Channel Rates",
                           static_cast<FEVInterface::frontEndMacroFunction_t>(
                               &ROCTrackerInterface::MeasureChannelRates),
-                          std::vector<std::string>{"TDC Mode"},
-                          std::vector<std::string>{"Return Code", "Rates"},
+                          std::vector<std::string>{},
+                          std::vector<std::string>{"Return Code", "Rates", "Saved hardware masks"},
                           1,
 	                        "" /* tooltip info here */);
 
@@ -351,9 +356,14 @@ ROCTrackerInterface::ROCTrackerInterface(
 	                        static_cast<FEVInterface::frontEndMacroFunction_t>(
 	                            &ROCTrackerInterface::FindAndSerializeThresholds),
 	                        std::vector<std::string>{"Threshold (mV)", "Tolerance (mV)", "Filesystem path"},
-	                        std::vector<std::string>{"Failed count", "DAC values", "Serialization successful"},
+	                        std::vector<std::string>{"Summary", "Failed count", "Serialization successful", "Resolved path", "Diagnostic path", "DAC values", "Threshold diagnostics"},
 	                        1,
-	                        "" /* tooltip info here */);
+	                        "Adjust all 96 CAL and HV thresholds and save all selected DACs, including failed searches, with calibration status metadata. "
+                            "Threshold (mV) uses the existing signed search convention; tolerance must be positive. "
+                            "Filesystem path may be blank for the configured ThresholdRoot/slot/ThresholdSet/MN path, "
+                            "an absolute root directory (writes slot_XX/thresholds-YY-mV/MNxxx.json, YY is Threshold in mV), "
+                            "or the matching MNxxx.json filename. "
+                            "Existing files are backed up as .bak. Run only with data taking stopped.");
 
   registerFEMacroFunction("Deserialize and set thresholds",
 	                        static_cast<FEVInterface::frontEndMacroFunction_t>(
@@ -395,6 +405,22 @@ void ROCTrackerInterface::onDTCReady()
 {
 	auto dtc = getDTC();
 	_roc     = std::make_shared<trkdaq::ROC>(linkID_, dtc);
+}
+
+std::string ROCTrackerInterface::getFirmwareVersion(void)
+{
+	if(!_roc)
+		throw std::runtime_error("Get ROC Firmware Version: DTC is not ready.");
+	const auto info = _roc->ReadDeviceInfo();
+	const auto gitCommit = _roc->ReadFirmwareGitCommit();
+	const auto userCode = _roc->ReadUserCode();
+	// The inherited macro returns this complete MIDAS-style report in Result.
+	// READDEVICE supplies FPGA metadata; READGITREV supplies controller source ID.
+	return std::format(
+	    "DeviceSerial:{}\nDesignVer   :{}\nDesignInfo  :{}\n"
+	    "BackLevelVer:{}\nUserCode    :'{:08x}'\ngit_commit  :'{}'\n",
+	    info.DeviceSerial, info.DesignVer, info.DesignInfo,
+	    info.BackLevelVer, userCode, gitCommit);
 }
 
 void ROCTrackerInterface::InitReadout(__ARGS__)
@@ -502,6 +528,14 @@ void ROCTrackerInterface::InitReadout(__ARGS__)
 		throw std::runtime_error(std::format(
 		    "Init Readout: parent DTC EventBuilderDTCID={} is outside 0-255.", dtcId));
 
+	// ROCCoreVInterface loads this ROC's EventWindowDelayOffset into delay_.
+	// Tracker firmware uses register 4 (10 bits), in 5 ns units.
+	if(delay_ > 0x3ffu)
+		throw std::runtime_error(std::format(
+		    "Init Readout: ROC '{}' EventWindowDelayOffset={} is outside 0-1023 (5 ns units).",
+		    getInterfaceUID(), delay_));
+	const uint16_t eventWindowDelay5ns = static_cast<uint16_t>(delay_);
+
 	const auto channelMasks = GetConfiguredChannelMasks();
 	trkdaq::ControlRoc_Read_Input_t0 readSettings;
 	readSettings.adc_mode =
@@ -534,10 +568,12 @@ void ROCTrackerInterface::InitReadout(__ARGS__)
 	    "  Read settings: {}\n"
 	    "  Channel masks: ROCTypeLinkTable/LinkToTrackerROCChannelsTable\n"
 	    "  DTC ID: {}/EventBuilderDTCID\n"
+	    "  Event-window delay: ROCInterfaceTable/EventWindowDelayOffset\n"
 	    "Settings\n"
 	    "  ROC link: {}\n"
 	    "  ROC readout mode: {}\n"
 	    "  Digitization window: {}-{} ticks (5 ns)\n"
+	    "  Event-window delay: {} ticks (5 ns), ROC register 4\n"
 	    "  ADC mode: {}\n"
 	    "  TDC mode: {}\n"
 	    "  Lookback: {}\n"
@@ -555,6 +591,7 @@ void ROCTrackerInterface::InitReadout(__ARGS__)
 	    rocReadoutMode,
 	    digitizationStart5ns,
 	    digitizationStop5ns,
+	    eventWindowDelay5ns,
 	    readSettings.adc_mode,
 	    readSettings.tdc_mode,
 	    readSettings.num_lookback,
@@ -572,6 +609,7 @@ void ROCTrackerInterface::InitReadout(__ARGS__)
 	                                 digitizationStart5ns,
 	                                 digitizationStop5ns,
 	                                 static_cast<uint8_t>(dtcId),
+	                                 eventWindowDelay5ns,
 	                                 readSettings,
 	                                 summary);
 	__SET_ARG_OUT__("Readout Mode", std::to_string(rocReadoutMode));
@@ -884,6 +922,35 @@ void ROCTrackerInterface::Preflight(__ARGS__)
 
 	trkdaq::NullStream null;
 	auto               stream = std::ostream(&null);
+	// Empty receive FIFOs do not establish receiver alignment. Always check
+	// internal B6, including when R18 passes. Register 8 selects the used lanes.
+	const uint16_t enabledLanes =
+	    static_cast<uint16_t>(_roc->ReadRegister(8) & 0x000F);
+	uint32_t alignment = 0;
+	const int alignmentReturnCode = _roc->DigiRead(0xB6, 3, alignment, 0, stream);
+	std::string alignmentText = "ERROR";
+	if(alignmentReturnCode != 0)
+		failures.emplace_back(std::format(
+		    "ROC internal 0xB6 read failed rc {}", alignmentReturnCode));
+	else
+	{
+		alignmentText = std::format("0x{:04X}", alignment & 0xFFFF);
+		const uint16_t missingLanes =
+		    static_cast<uint16_t>(enabledLanes & ~alignment);
+		if(missingLanes != 0)
+		{
+			constexpr std::array<const char*, 4> laneNames = {
+			    "CAL0", "CAL1", "HV0", "HV1"};
+			std::string missingNames;
+			for(size_t lane = 0; lane < laneNames.size(); ++lane)
+				if(missingLanes & (1u << lane))
+					missingNames +=
+					    (missingNames.empty() ? "" : ", ") + std::string(laneNames[lane]);
+			failures.emplace_back(std::format(
+			    "ROC internal 0xB6 read {}, enabled lanes 0x{:X}; unaligned: {}",
+			    alignmentText, enabledLanes, missingNames));
+		}
+	}
 	for(size_t checkIndex = 0; checkIndex < digiChecks.size(); ++checkIndex)
 	{
 		const auto& check = digiChecks[checkIndex];
@@ -927,6 +994,8 @@ void ROCTrackerInterface::Preflight(__ARGS__)
 
 	__SET_ARG_OUT__("Return code", std::to_string(failures.size()));
 	__SET_ARG_OUT__("ROC FIFO status", std::format("0x{:04X}", rocFifoStatus));
+	__SET_ARG_OUT__("ROC enabled lanes", std::format("0x{:X}", enabledLanes));
+	__SET_ARG_OUT__("ROC alignment 0xB6", alignmentText);
 	__SET_ARG_OUT__("CAL DIGI 0xA4", calValues[0]);
 	__SET_ARG_OUT__("HV DIGI 0xA4", hvValues[0]);
 	__SET_ARG_OUT__("CAL DIGI 0xA5", calValues[1]);
@@ -1008,6 +1077,11 @@ void ROCTrackerInterface::ReadSerialNumber(__ARGS__)
 std::string ROCTrackerInterface::FormatThresholdTable(
     const std::vector<float>& thresholds)
 {
+    if(thresholds.size() != 288)
+    {
+        throw std::runtime_error(std::format(
+            "Threshold table requires 288 measured values; received {}.", thresholds.size()));
+    }
 	std::stringstream table;
 	table << std::endl;
 	table << std::format(" {:>7} {:>11} {:>11} {:>11}\n", "Channel", "Cal", "HV", "Sum");
@@ -1031,8 +1105,7 @@ void ROCTrackerInterface::MeasureThresholds(__ARGS__)
 	uint32_t           mask_md     = 0xFFFFFFFF;
 	uint32_t           mask_hi     = 0xFFFFFFFF;
 	int                print_level = 0;
-	trkdaq::NullStream null;
-	auto               stream = std::ostream(&null);
+	std::ostringstream stream;
 
 	std::vector<float> thresholds;
 	__FE_COUT__ << "ROCTrackerInterface::MeasureThresholds" << __E__;
@@ -1040,6 +1113,12 @@ void ROCTrackerInterface::MeasureThresholds(__ARGS__)
 	    _roc->ReadThresholds(thresholds, mask_lo, mask_md, mask_hi, print_level, stream);
 
 	__SET_ARG_OUT__("Return code", std::to_string(rv));
+    if(rv != 0 || thresholds.size() != 288)
+    {
+        throw std::runtime_error(std::format(
+            "Measure Thresholds failed (return code {}, received {} of 288 values). {}",
+            rv, thresholds.size(), stream.str()));
+    }
 	__SET_ARG_OUT__("Thresholds", FormatThresholdTable(thresholds));
 }
 
@@ -1060,7 +1139,7 @@ void ROCTrackerInterface::FindThreshold(__ARGS__)
 		__FE_SS__ << "Preamp must be 0 or 1: " << preamp << __E__;
 		__FE_SS_THROW__;
 	}
-	if(tolerance_mv <= 0.0f)
+	if(!std::isfinite(threshold_mv) || !std::isfinite(tolerance_mv) || tolerance_mv <= 0.0f)
 	{
 		__FE_SS__ << "Tolerance (mV) must be positive: " << tolerance_mv << __E__;
 		__FE_SS_THROW__;
@@ -1070,10 +1149,41 @@ void ROCTrackerInterface::FindThreshold(__ARGS__)
 	__FE_COUT__ << "ROCTrackerInterface::FindThreshold channel=" << channel
 	            << " preamp=" << preamp << " threshold_mv=" << threshold_mv
 	            << " tolerance_mv=" << tolerance_mv << __E__;
-	auto success = _roc->FindThreshold(channel, preamp, threshold_mv, tolerance_mv, dac);
+	trkdaq::ThresholdSearchResult detail;
+	auto success = _roc->FindThreshold(channel, preamp, threshold_mv, tolerance_mv, dac, &detail);
+	__SET_ARG_OUT__("Threshold diagnostics", trkdaq::FormatThresholdSearchResult(channel, preamp, detail));
 
 	__SET_ARG_OUT__("Success", std::to_string(success));
 	__SET_ARG_OUT__("DAC value", std::to_string(dac));
+}
+
+namespace {
+std::string FormatSearchSummary(const std::vector<trkdaq::ThresholdSearchResult>& details,
+                                float target) {
+  size_t failed = 0;
+  for (const auto& detail : details) if (!detail.success()) ++failed;
+  std::string text = std::format("{} passed, {} failed.", details.size() - failed, failed);
+  for (size_t i = 0; i < details.size(); ++i) {
+    const auto& d = details[i];
+    if (d.success()) continue;
+    const char* reason = d.status == "unreachable" ? "target outside measured endpoint range" :
+                         d.status == "unstable" ? "verification readings outside tolerance" :
+                         "could not reach requested tolerance";
+    const auto range = std::minmax_element(d.verification_mv.begin(), d.verification_mv.end());
+    text += std::format("\n- Channel {} {}: {} ({}); measured {:.3f} mV, target {:.3f} mV, "
+                        "error {:+.3f} mV, DAC {}; verification {:.3f} to {:.3f} mV.",
+                        i / 2, i % 2 == 0 ? "CAL" : "HV", d.status, reason,
+                        d.measured_mv, target, d.error_mv, d.dac, *range.first, *range.second);
+  }
+  return text;
+}
+
+std::string FormatSearchDetails(const std::vector<trkdaq::ThresholdSearchResult>& details) {
+  std::string text = "Measured values use the requested threshold sign convention.\n";
+  for (size_t i = 0; i < details.size(); ++i)
+    text += trkdaq::FormatThresholdSearchResult(i / 2, i % 2, details[i]);
+  return text;
+}
 }
 
 std::string ROCTrackerInterface::FormatDacTable(
@@ -1098,7 +1208,7 @@ void ROCTrackerInterface::FindThresholds(__ARGS__)
 	float threshold_mv = __GET_ARG_IN__("Threshold (mV)", float, 0.0f);
 	float tolerance_mv = __GET_ARG_IN__("Tolerance (mV)", float, 0.0f);
 
-	if(tolerance_mv <= 0.0f)
+	if(!std::isfinite(threshold_mv) || !std::isfinite(tolerance_mv) || tolerance_mv <= 0.0f)
 	{
 		__FE_SS__ << "Tolerance (mV) must be positive: " << tolerance_mv << __E__;
 		__FE_SS_THROW__;
@@ -1107,10 +1217,17 @@ void ROCTrackerInterface::FindThresholds(__ARGS__)
 	std::vector<DTCLib::roc_data_t> dacs;
 	__FE_COUT__ << "ROCTrackerInterface::FindThresholds threshold_mv=" << threshold_mv
 	            << " tolerance_mv=" << tolerance_mv << __E__;
-	auto n_failed = _roc->FindThresholds(threshold_mv, tolerance_mv, dacs);
+	std::vector<trkdaq::ThresholdSearchResult> details;
+	auto n_failed = _roc->FindThresholds(threshold_mv, tolerance_mv, dacs, &details,
+      [this](size_t completed, size_t total) {
+        __SET_PCT_DONE__(std::min<size_t>(99, 100 * completed / total));
+      });
+	__SET_ARG_OUT__("Threshold diagnostics", FormatSearchDetails(details));
 
 	__SET_ARG_OUT__("Failed count", std::to_string(n_failed));
 	__SET_ARG_OUT__("DAC values", FormatDacTable(dacs));
+    __SET_ARG_OUT__("Summary", FormatSearchSummary(details, threshold_mv));
+    __SET_PCT_DONE__(100);
 }
 
 void ROCTrackerInterface::SetChannelMask(__ARGS__)
@@ -1392,13 +1509,21 @@ std::string ROCTrackerInterface::FormatRatesTable(
 
 void ROCTrackerInterface::MeasureChannelRates(__ARGS__)
 {
-  uint16_t tdc_mode = __GET_ARG_IN__("TDC Mode", uint16_t, 0);
+  constexpr uint16_t tdc_mode = 0;  // Use the existing rate-measurement default.
 
   __FE_COUT__ << "ROCTrackerInterface::MeasureChannelRates" << __E__;
   std::vector<trkdaq::ROC::rates_t> rates;
-  auto rv = _roc->ChannelRates(tdc_mode, rates);
+  std::array<uint16_t, 6> masksBeforeRead{};
+  auto rv = _roc->ChannelRates(tdc_mode, rates, &masksBeforeRead);
+  if(rv != 0)
+    throw std::runtime_error(std::format("Read Rates failed with return code {}", rv));
   __SET_ARG_OUT__("Return Code", std::to_string(rv));
   __SET_ARG_OUT__("Rates", FormatRatesTable(rates));
+  __SET_ARG_OUT__("Saved hardware masks", std::format(
+      "ROC {}: CAL 0x{:04x} 0x{:04x} 0x{:04x}; HV 0x{:04x} 0x{:04x} 0x{:04x}",
+      static_cast<unsigned int>(linkID_),
+      masksBeforeRead[0], masksBeforeRead[1], masksBeforeRead[2],
+      masksBeforeRead[3], masksBeforeRead[4], masksBeforeRead[5]));
 }
 
 /* --- */
@@ -1509,42 +1634,240 @@ bool ROCTrackerInterface::emulatorWorkLoop(void)
 }  // end emulatorWorkLoop()
 
 
+std::string ROCTrackerInterface::ResolveThresholdFilePath(
+    const std::string& rootOverride, const std::string& setOverride)
+{
+	auto* configurationManager = getConfigurationManager();
+	if(!configurationManager)
+		throw std::runtime_error(
+		    "Threshold file: no active ConfigurationManager is available.");
+
+	// The XDAQ context is the stable key joining this FE instance to its tracker node.
+	const std::string contextUID = getContextUID();
+	unsigned int      slot       = 0;
+	size_t            nodeMatches = 0;
+	const auto nodeRows =
+	    configurationManager->getNode("/SubsystemTrackerNodeMapTable").getChildren();
+	for(const auto& row : nodeRows)
+	{
+		if(!row.second.isEnabled())
+			continue;
+		if(row.second.getNode("XDAQContextLinkUID").getValueAsString(
+		       true /* return the UID stored in the node-map row */) != contextUID)
+			continue;
+
+		slot = row.second.getNode("Slot").getValue<unsigned int>();
+		++nodeMatches;
+	}
+	if(nodeMatches != 1)
+		throw std::runtime_error(
+		    std::format("Threshold file: expected exactly one enabled "
+		                "SubsystemTrackerNodeMapTable row for XDAQ context '{}', found {}.",
+		                contextUID,
+		                nodeMatches));
+	if(slot > 17)
+		throw std::runtime_error(std::format(
+		    "Threshold file: slot {} for XDAQ context '{}' is outside 0-17.",
+		    slot,
+		    contextUID));
+
+	auto getGlobalParameter = [&](const std::string& parameterName,
+	                              const std::string& expectedType) {
+		std::string value;
+		size_t      matches = 0;
+		const auto parameterRows = configurationManager
+		                               ->getNode("/SubsystemTrackerGlobalParametersTable")
+		                               .getChildren();
+		for(const auto& row : parameterRows)
+		{
+			if(!row.second.isEnabled() || row.first != parameterName)
+				continue;
+
+			const std::string parameterType =
+			    row.second.getNode("ParameterType").getValue<std::string>();
+			if(parameterType != expectedType)
+				throw std::runtime_error(std::format(
+				    "Threshold file: parameter '{}' has type '{}'; expected '{}'.",
+				    parameterName,
+				    parameterType,
+				    expectedType));
+			value = row.second.getNode("ParameterValue").getValue<std::string>();
+			++matches;
+		}
+		if(matches != 1)
+			throw std::runtime_error(std::format(
+			    "Threshold file: expected exactly one enabled global parameter "
+			    "named '{}', found {}.",
+			    parameterName,
+			    matches));
+		if(value.empty())
+			throw std::runtime_error(std::format(
+			    "Threshold file: global parameter '{}' is empty.", parameterName));
+		return value;
+	};
+
+	const std::filesystem::path thresholdRoot(
+	    rootOverride.empty() ? getGlobalParameter("ThresholdRoot", "PATH") : rootOverride);
+	const std::filesystem::path thresholdSet(
+	    setOverride.empty() ? getGlobalParameter("ThresholdSet", "STRING") : setOverride);
+	if(!thresholdRoot.is_absolute())
+		throw std::runtime_error(std::format(
+		    "Threshold file: ThresholdRoot '{}' is not an absolute path.",
+		    thresholdRoot.string()));
+	if(thresholdSet.is_absolute() || thresholdSet.has_parent_path() ||
+	   thresholdSet == "." || thresholdSet == "..")
+		throw std::runtime_error(std::format(
+		    "Threshold file: ThresholdSet '{}' must be one relative directory name.",
+		    thresholdSet.string()));
+
+	const int panelID = _roc->ReadPanelID();
+	if(panelID < 0)
+	{
+		const std::string reason =
+		    panelID == -2
+		        ? "ROC link is enabled but not locked"
+		        : "ROC link is disabled or the panel-ID reply was invalid";
+		throw std::runtime_error(std::format(
+		    "Threshold file: ReadPanelID failed with code {} ({}); "
+		    "cannot select a threshold JSON file.",
+		    panelID,
+		    reason));
+	}
+	if(panelID > 999)
+		throw std::runtime_error(
+		    std::format("Threshold file: panel ID {} is outside 0-999.", panelID));
+
+	const std::filesystem::path resolvedPath =
+	    (thresholdRoot / std::format("slot_{:02d}", slot) / thresholdSet /
+	     std::format("MN{:03d}.json", panelID))
+	        .lexically_normal();
+	return resolvedPath.string();
+}
+
 void ROCTrackerInterface::FindAndSerializeThresholds(__ARGS__)
 {
-	float threshold_mv = __GET_ARG_IN__("Threshold (mV)", float, 0.0f);
-	float tolerance_mv = __GET_ARG_IN__("Tolerance (mV)", float, 0.0f);
-  std::string path   = __GET_ARG_IN__("Filesystem path", std::string, "");
+  __SET_PCT_DONE__(0);
+  const float threshold_mv = __GET_ARG_IN__("Threshold (mV)", float, 0.0f);
+  const float tolerance_mv = __GET_ARG_IN__("Tolerance (mV)", float, 0.0f);
+  const std::string path = __GET_ARG_IN__("Filesystem path", std::string, "");
+  if(!std::isfinite(threshold_mv) || !std::isfinite(tolerance_mv) || tolerance_mv <= 0)
+    throw std::runtime_error("Find thresholds: threshold must be finite and tolerance must be finite and positive.");
 
-	if(tolerance_mv <= 0.0f)
-	{
-		__FE_SS__ << "Tolerance (mV) must be positive: " << tolerance_mv << __E__;
-		__FE_SS_THROW__;
-	}
-
-	std::vector<DTCLib::roc_data_t> dacs;
-	__FE_COUT__ << "ROCTrackerInterface::FindThresholds threshold_mv=" << threshold_mv
-	            << " tolerance_mv=" << tolerance_mv << __E__;
-	auto n_failed = _roc->FindThresholds(threshold_mv, tolerance_mv, dacs);
-
-  // build key from minnesota id
-  auto minnesota = _roc->ReadPanelID();
-  std::ostringstream ss;
-  ss << std::setw(3) << std::setfill('0') << minnesota;
-  auto key = "MN" + ss.str();
-  // cast into json
-  nlohmann::json value;
-  for (size_t i = 0 ; i < 96 ; i++){
-    value[std::to_string(i)] = {
-      {"Cal", dacs[2*i + 0]},
-      {"HV",  dacs[2*i + 1]}
-    };
+  __SET_ARG_OUT__("Serialization successful", "0");
+  std::filesystem::path resolvedPath;
+  if(path.empty())
+    resolvedPath = ResolveThresholdFilePath();
+  else
+  {
+    resolvedPath = std::filesystem::path(path);
+    if(!resolvedPath.is_absolute())
+      throw std::runtime_error("Find thresholds: Filesystem path must be absolute, or blank for the configured path.");
+    if(resolvedPath.extension() == ".json")
+    {
+      // Preserve the explicit single-panel filename override.
+      const int panelID = _roc->ReadPanelID();
+      if(panelID < 0 || panelID > 999)
+        throw std::runtime_error(std::format("Find thresholds: invalid panel ID {}, cannot select output file.", panelID));
+      const auto filename = std::format("MN{:03d}.json", panelID);
+      if(resolvedPath.filename() != filename)
+        throw std::runtime_error(std::format("Find thresholds: output filename must be {} for this ROC.", filename));
+    }
+    else
+      // Directory input is a root; use the same context-to-slot mapping as the loader.
+      resolvedPath = ResolveThresholdFilePath(
+          path, std::format("thresholds-{}-mV", threshold_mv == 0 ? 0.0f : threshold_mv));
   }
-  // write to disk
-  auto written = ROCTrackerInterface::SafeSerialize(path, key, value);
+  resolvedPath = resolvedPath.lexically_normal();
+  __SET_ARG_OUT__("Resolved path", resolvedPath.string());
 
-	__SET_ARG_OUT__("Failed count", std::to_string(n_failed));
-	__SET_ARG_OUT__("DAC values", FormatDacTable(dacs));
-  __SET_ARG_OUT__("Serialization successful", std::to_string(written));
+  // Prepare a writable file and backup before changing any DAC. Each panel has
+  // its own destination, avoiding shared JSON read/modify/write in global runs.
+  std::filesystem::create_directories(resolvedPath.parent_path());
+  const bool hadPrevious = std::filesystem::exists(resolvedPath);
+  const std::filesystem::path backupPath(resolvedPath.string() + ".bak");
+  if(hadPrevious)
+  {
+    if(!std::filesystem::is_regular_file(resolvedPath))
+      throw std::runtime_error("Find thresholds: destination is not a regular file: " + resolvedPath.string());
+    std::filesystem::copy_file(resolvedPath, backupPath,
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+  std::string temporaryPattern = resolvedPath.string() + ".tmp.XXXXXX";
+  std::vector<char> temporaryName(temporaryPattern.begin(), temporaryPattern.end());
+  temporaryName.push_back('\0');
+  const int fd = ::mkstemp(temporaryName.data());
+  if(fd < 0)
+    throw std::runtime_error("Find thresholds: cannot create temporary output file beside " + resolvedPath.string());
+  struct TemporaryFile
+  {
+    std::filesystem::path path;
+    ~TemporaryFile() { std::error_code ignored; std::filesystem::remove(path, ignored); }
+  } temporary{std::filesystem::path(temporaryName.data())};
+  if(::close(fd) != 0)
+    throw std::runtime_error("Find thresholds: failed to close temporary output file.");
+  const auto filePermissions = hadPrevious ? std::filesystem::status(resolvedPath).permissions()
+      : (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+         std::filesystem::perms::group_read | std::filesystem::perms::others_read);
+  std::filesystem::permissions(temporary.path, filePermissions);
+  std::ofstream output(temporary.path);
+  output.exceptions(std::ios::failbit | std::ios::badbit);
+
+  std::vector<DTCLib::roc_data_t> dacs;
+  std::vector<trkdaq::ThresholdSearchResult> details;
+	auto n_failed = _roc->FindThresholds(threshold_mv, tolerance_mv, dacs, &details,
+      [this](size_t completed, size_t total) {
+        __SET_PCT_DONE__(std::min<size_t>(99, 100 * completed / total));
+      });
+	__SET_ARG_OUT__("Threshold diagnostics", FormatSearchDetails(details));
+  __SET_ARG_OUT__("Failed count", std::to_string(n_failed));
+  if(dacs.size() != 192 || details.size() != 192)
+    throw std::runtime_error("Find thresholds: expected 192 CAL/HV DAC values.");
+  __SET_ARG_OUT__("DAC values", FormatDacTable(dacs));
+  // Save detailed measurements for both passing and failed searches. Use the
+  // already-created temporary file and atomic rename; it is never a loader file.
+  const std::filesystem::path diagnosticPath(resolvedPath.string() + ".diagnostics.txt");
+  output << "threshold_mV=" << threshold_mv << " tolerance_mV=" << tolerance_mv
+         << " failed=" << n_failed << '\n' << FormatSearchDetails(details);
+  output.close();
+  std::filesystem::rename(temporary.path, diagnosticPath);
+  __SET_ARG_OUT__("Diagnostic path", diagnosticPath.string());
+
+  // Exact schema consumed by DeserializeAndSetThresholds: one CAL and one HV
+  // record for each logical channel, with integer 10-bit DAC thresholds.
+  nlohmann::json value = nlohmann::json::array();
+  for(size_t channel = 0; channel < 96; ++channel)
+    for(size_t type = 0; type < 2; ++type)
+    {
+      const auto dac = dacs[2 * channel + type];
+      if(dac > 1023)
+        throw std::runtime_error("Find thresholds: refusing to save a DAC outside 0-1023.");
+      const auto& detail = details.at(2 * channel + type);
+      // Preserve the loader's required channel/type/threshold fields. Metadata
+      // makes non-converged values explicit without preventing the user's save.
+      value.push_back({{"channel", channel}, {"type", type == 0 ? "cal" : "hv"},
+          {"threshold", dac}, {"calibration_status", detail.status},
+          {"target_mv", threshold_mv}, {"tolerance_mv", tolerance_mv},
+          {"measured_mv", detail.measured_mv}, {"error_mv", detail.error_mv},
+          {"verification_mv", detail.verification_mv}});
+    }
+  output.open(temporary.path);
+  std::filesystem::permissions(temporary.path, filePermissions);
+  output << value.dump(2) << '\n';
+  output.close();
+  nlohmann::json readback;
+  std::ifstream input(temporary.path);
+  input >> readback;
+  if(readback != value)
+    throw std::runtime_error("Find thresholds: saved JSON verification failed.");
+  input.close();
+  std::filesystem::rename(temporary.path, resolvedPath);
+  __SET_ARG_OUT__("Serialization successful", "1");
+  __SET_ARG_OUT__("Summary", FormatSearchSummary(details, threshold_mv) + std::format(
+      "\nSaved all 192 CAL/HV DAC values to {}, including {} failed searches. "
+      "{}Hardware remains at the selected DAC values.",
+      resolvedPath.string(), n_failed,
+      hadPrevious ? "Previous file: " + backupPath.string() + ". " : ""));
+  __SET_PCT_DONE__(100);
 }
 
 void ROCTrackerInterface::DeserializeAndSetThresholds(__ARGS__)
@@ -1568,110 +1891,7 @@ void ROCTrackerInterface::DeserializeAndSetThresholds(__ARGS__)
 	}
 	__SET_ARG_OUT__("Failed count", "0");
 
-	auto* configurationManager = getConfigurationManager();
-	if(!configurationManager)
-		throw std::runtime_error(
-		    "Deserialize and set thresholds: no active ConfigurationManager is available.");
-
-	// The XDAQ context is the stable key joining this FE instance to its tracker node.
-	const std::string contextUID = getContextUID();
-	unsigned int      slot       = 0;
-	size_t            nodeMatches = 0;
-	const auto nodeRows =
-	    configurationManager->getNode("/SubsystemTrackerNodeMapTable").getChildren();
-	for(const auto& row : nodeRows)
-	{
-		if(!row.second.isEnabled())
-			continue;
-		if(row.second.getNode("XDAQContextLinkUID").getValueAsString(
-		       true /* return the UID stored in the node-map row */) != contextUID)
-			continue;
-
-		slot = row.second.getNode("Slot").getValue<unsigned int>();
-		++nodeMatches;
-	}
-	if(nodeMatches != 1)
-		throw std::runtime_error(
-		    std::format("Deserialize and set thresholds: expected exactly one enabled "
-		                "SubsystemTrackerNodeMapTable row for XDAQ context '{}', found {}.",
-		                contextUID,
-		                nodeMatches));
-	if(slot > 17)
-		throw std::runtime_error(std::format(
-		    "Deserialize and set thresholds: slot {} for XDAQ context '{}' is outside 0-17.",
-		    slot,
-		    contextUID));
-
-	auto getGlobalParameter = [&](const std::string& parameterName,
-	                              const std::string& expectedType) {
-		std::string value;
-		size_t      matches = 0;
-		const auto parameterRows = configurationManager
-		                               ->getNode("/SubsystemTrackerGlobalParametersTable")
-		                               .getChildren();
-		for(const auto& row : parameterRows)
-		{
-			if(!row.second.isEnabled() || row.first != parameterName)
-				continue;
-
-			const std::string parameterType =
-			    row.second.getNode("ParameterType").getValue<std::string>();
-			if(parameterType != expectedType)
-				throw std::runtime_error(std::format(
-				    "Deserialize and set thresholds: parameter '{}' has type '{}'; expected '{}'.",
-				    parameterName,
-				    parameterType,
-				    expectedType));
-			value = row.second.getNode("ParameterValue").getValue<std::string>();
-			++matches;
-		}
-		if(matches != 1)
-			throw std::runtime_error(std::format(
-			    "Deserialize and set thresholds: expected exactly one enabled global parameter "
-			    "named '{}', found {}.",
-			    parameterName,
-			    matches));
-		if(value.empty())
-			throw std::runtime_error(std::format(
-			    "Deserialize and set thresholds: global parameter '{}' is empty.", parameterName));
-		return value;
-	};
-
-	const std::filesystem::path thresholdRoot(
-	    getGlobalParameter("ThresholdRoot", "PATH"));
-	const std::filesystem::path thresholdSet(
-	    getGlobalParameter("ThresholdSet", "STRING"));
-	if(!thresholdRoot.is_absolute())
-		throw std::runtime_error(std::format(
-		    "Deserialize and set thresholds: ThresholdRoot '{}' is not an absolute path.",
-		    thresholdRoot.string()));
-	if(thresholdSet.is_absolute() || thresholdSet.has_parent_path() ||
-	   thresholdSet == "." || thresholdSet == "..")
-		throw std::runtime_error(std::format(
-		    "Deserialize and set thresholds: ThresholdSet '{}' must be one relative directory name.",
-		    thresholdSet.string()));
-
-	const int panelID = _roc->ReadPanelID();
-	if(panelID < 0)
-	{
-		const std::string reason =
-		    panelID == -2
-		        ? "ROC link is enabled but not locked"
-		        : "ROC link is disabled or the panel-ID reply was invalid";
-		throw std::runtime_error(std::format(
-		    "Deserialize and set thresholds: ReadPanelID failed with code {} ({}); "
-		    "cannot select a threshold JSON file.",
-		    panelID,
-		    reason));
-	}
-	if(panelID > 999)
-		throw std::runtime_error(
-		    std::format("Deserialize and set thresholds: panel ID {} is outside 0-999.", panelID));
-
-	const std::filesystem::path resolvedPath =
-	    (thresholdRoot / std::format("slot_{:02d}", slot) / thresholdSet /
-	     std::format("MN{:03d}.json", panelID))
-	        .lexically_normal();
+	const std::filesystem::path resolvedPath(ResolveThresholdFilePath());
 	__SET_ARG_OUT__("Resolved path", resolvedPath.string());
 
 	std::error_code filesystemError;
@@ -1684,7 +1904,6 @@ void ROCTrackerInterface::DeserializeAndSetThresholds(__ARGS__)
 
 	nlohmann::json json;
 	{
-		std::lock_guard lock(ROCTrackerInterface::_json_filesystem_mutex);
 		std::ifstream   input(resolvedPath);
 		if(!input)
 			throw std::runtime_error(std::format(
@@ -1784,11 +2003,8 @@ void ROCTrackerInterface::DeserializeAndSetThresholds(__ARGS__)
 	{
 		__SET_ARG_OUT__("Summary",
 		                appendThresholdWarnings(std::format(
-		                    "Validated 192 threshold records for context {}, slot {}, "
-		                    "panel MN{:03d}; no DACs were programmed.",
-		                    contextUID,
-		                    slot,
-		                    panelID)));
+		                    "Validated 192 threshold records from {}; no DACs were programmed.",
+		                    resolvedPath.string())));
 		return;
 	}
 
@@ -1809,11 +2025,8 @@ void ROCTrackerInterface::DeserializeAndSetThresholds(__ARGS__)
 	__SET_ARG_OUT__("Failed count", std::to_string(nFailed));
 	__SET_ARG_OUT__("Summary",
 	                appendThresholdWarnings(std::format(
-	                    "Programmed 192 threshold DACs for context {}, slot {}, "
-	                    "panel MN{:03d}; {} writes returned failure.",
-	                    contextUID,
-	                    slot,
-	                    panelID,
+	                    "Programmed 192 threshold DACs from {}; {} writes returned failure.",
+	                    resolvedPath.string(),
 	                    nFailed)));
 }
 
@@ -1830,8 +2043,6 @@ void ROCTrackerInterface::TestJSON(__ARGS__){
 bool ROCTrackerInterface::SafeSerialize(std::string path,
                                         std::string key,
                                         nlohmann::json value){
-  // lock on filesystem access read/write
-  std::lock_guard lock(ROCTrackerInterface::_json_filesystem_mutex);
   nlohmann::json json;
 
   // read preexisting mappings from disk
@@ -1858,8 +2069,6 @@ bool ROCTrackerInterface::SafeSerialize(std::string path,
 
 nlohmann::json ROCTrackerInterface::SafeDeserialize(std::string path,
                                                     std::string key){
-  // lock on filesystem access read/write
-  std::lock_guard lock(ROCTrackerInterface::_json_filesystem_mutex);
   nlohmann::json json;
 
   // read preexisting mappings from disk

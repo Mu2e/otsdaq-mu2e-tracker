@@ -459,6 +459,59 @@ var Mu2eHardware = Mu2eHardware || {};
 		return foundTarget ? inputs : null;
 	};
 
+	// Validate all global inputs and explicit enabled-link masks before dispatch.
+	Mu2eHardware.thresholdScanSettings = function (threshold, tolerance, directory) {
+		threshold = String(threshold).trim();
+		tolerance = String(tolerance).trim();
+		directory = String(directory || "").trim();
+		if (!threshold || !tolerance || !isFinite(Number(threshold)) ||
+			!isFinite(Number(tolerance)) || Number(tolerance) <= 0)
+			throw new Error("Enter a finite threshold and a positive tolerance in mV.");
+		if (directory && (directory[0] !== "/" || /\.json\/?$/i.test(directory)))
+			throw new Error("Use an absolute root directory (writes slot_XX/thresholds-YY-mV/MNxxx.json), or leave it blank for configured per-panel paths.");
+		return {"Threshold (mV)": String(Number(threshold)),
+			"Tolerance (mV)": String(Number(tolerance)), "Filesystem path": directory};
+	};
+
+	Mu2eHardware.thresholdScanInputs = function (uid, settings) {
+		var name = "ROC FEMacro - Find and serialize thresholds";
+		var macro = (Mu2eHardware.getMacrosForDevice(uid) || {})[name];
+		if (!macro || !macro.outputs || macro.outputs.indexOf("Resolved path") < 0)
+			throw new Error(uid + ": updated threshold-save macro is not loaded; compile/load it and refresh first.");
+		var inputs = Mu2eHardware.getAllROCInputs(uid, name);
+		if (!inputs) throw new Error(uid + ": ROC target input is unavailable.");
+		var mask = 0;
+		Mu2eHardware.getROCsForDTC(uid).forEach(function (roc) {
+			if (!roc.enabled) return;
+			if (!Number.isInteger(roc.linkIndex) || roc.linkIndex < 0 || roc.linkIndex > 5)
+				throw new Error(uid + ": invalid enabled ROC link.");
+			mask |= 1 << (4 * roc.linkIndex);
+		});
+		if (!mask) throw new Error(uid + ": no enabled ROCs.");
+		Object.keys(inputs).forEach(function (key) { inputs[key] = "0x" + mask.toString(16); });
+		Object.keys(settings).forEach(function (key) { inputs[key] = settings[key]; });
+		return inputs;
+	};
+
+	Mu2eHardware.thresholdScanSucceeded = function (result) {
+		if (!result || result.error || !result.targets || !result.targets.length) return false;
+		function numbers(value) {
+			try {
+				var parsed = JSON.parse(String(value).replace(/\s*\(0x[0-9a-f]+\)/gi, ""));
+				var values = Array.isArray(parsed) ? parsed : [parsed];
+				return values.length && values.every(Number.isInteger) ? values : null;
+			} catch (e) { return null; }
+		}
+		return result.targets.every(function (target) {
+			var outputs = target.outputs || {};
+			var failed = numbers(outputs["Failed count"]);
+			var saved = numbers(outputs["Serialization successful"]);
+			return failed && saved && failed.length === saved.length &&
+				failed.every(function (n) { return n === 0; }) &&
+				saved.every(function (n) { return n === 1; });
+		});
+	};
+
 	// =========================================================================
 	// runMacroOnUIDs — parallel batch execution for an explicit device list
 	//
@@ -1607,6 +1660,65 @@ var Mu2eHardware = Mu2eHardware || {};
 		return isFinite(scalar) ? [scalar] : null;
 	}
 
+	// ROC/utils.c channel_map at c2d8bf5: raw DIGI index -> logical channel.
+	// Saved words are CAL 0x0B/0x0E/0x0D followed by HV 0x0B/0x0E/0x0D.
+	var _rateHardwareChannelMap = [
+		91, 85, 79, 73, 67, 61, 55, 49,
+		43, 37, 31, 25, 19, 13, 7, 1,
+		90, 84, 78, 72, 66, 60, 54, 48,
+		42, 36, 30, 24, 18, 12, 6, 0,
+		93, 87, 81, 75, 69, 63, 57, 51,
+		45, 39, 33, 27, 21, 15, 9, 3,
+		44, 38, 32, 26, 20, 14, 8, 2,
+		92, 86, 80, 74, 68, 62, 56, 50,
+		47, 41, 35, 29, 23, 17, 11, 5,
+		95, 89, 83, 77, 71, 65, 59, 53,
+		46, 40, 34, 28, 22, 16, 10, 4,
+		94, 88, 82, 76, 70, 64, 58, 52
+	];
+
+	function _parseSavedHardwareMasks(value) {
+		if (typeof value !== "string") return null;
+		var byLink = {}, match, count = 0;
+		var pattern = /ROC ([0-5]): CAL (0x[0-9a-f]{4}) (0x[0-9a-f]{4}) (0x[0-9a-f]{4}); HV (0x[0-9a-f]{4}) (0x[0-9a-f]{4}) (0x[0-9a-f]{4})(?![0-9a-f])/gi;
+		while ((match = pattern.exec(value)) !== null) {
+			var link = Number(match[1]);
+			if (byLink[link]) return null; // ambiguous association: do not colour
+			var words = match.slice(2).map(function (word) { return parseInt(word, 16); });
+			var excluded = new Array(96);
+			for (var index = 0; index < 96; ++index)
+				excluded[_rateHardwareChannelMap[index]] =
+					(words[Math.floor(index / 16)] & (1 << (index % 16))) === 0;
+			byLink[link] = excluded;
+			++count;
+		}
+		return count ? byLink : null;
+	}
+
+	function _rateCellHTML(value, excluded) {
+		var className = "settings-value";
+		var title = "";
+		if (excluded === true) {
+			className += " rate-masked";
+			title = "Masked off in hardware before this rate measurement";
+		} else if (excluded === false && isFinite(Number(value)) && Number(value) > 10) {
+			className += " rate-high";
+			title = "Unmasked channel rate above 10 kHz";
+		}
+		return "<td class='" + className + "'" + (title ? " title='" + title + "'" : "") +
+			">" + _esc(value) + "</td>";
+	}
+
+	function _rateExclusionLegend(exclusions, rocNames) {
+		var html = "<div class='rate-exclusion-legend'>Grey: masked off in hardware before measurement; " +
+			"red: unmasked rate above 10 kHz.</div>";
+		var byROC = exclusions.byROC;
+		var unavailable = rocNames.filter(function (uid) { return !byROC[uid]; });
+		if (unavailable.length) html += "<div>Saved hardware masks unavailable for " +
+			_esc(unavailable.join(", ")) + "; those rates are unmarked.</div>";
+		return html;
+	}
+
 	// The same forwarded ROC macro serves both scopes.  A selected ROC gets all
 	// three counters; a DTC gets the Total counter as one column per ROC.
 	Mu2eHardware.formatChannelRatesTable = function (outputs, deviceUID) {
@@ -1614,7 +1726,31 @@ var Mu2eHardware = Mu2eHardware || {};
 		if (!tables) return "";
 
 		var isROC = Mu2eHardware.getDeviceType(deviceUID) === "roc";
-		var html = "<div style='overflow:auto;max-height:520px;margin-top:4px;'>";
+		var byROC = {};
+		var exclusions = {byROC: byROC};
+		var hardwareMasks = _parseSavedHardwareMasks(outputs["Saved hardware masks"]);
+		var html = "";
+		var configuredROCs = Mu2eHardware.getROCsForDTC(deviceUID);
+		var rocNames = {};
+		for (var r = 0; r < configuredROCs.length; ++r)
+			rocNames[configuredROCs[r].linkIndex] = configuredROCs[r].name;
+		var rocLinks = isROC ? [] : _parseROCTargets(outputs["Target ROC"]);
+		if (!isROC && (!rocLinks || rocLinks.length !== tables.length)) return "";
+		if (hardwareMasks) {
+			if (isROC) {
+				var maskLinks = Object.keys(hardwareMasks);
+				if (maskLinks.length === 1 && tables.length === 1)
+					byROC[deviceUID] = hardwareMasks[maskLinks[0]];
+			} else {
+				rocLinks.forEach(function (link) {
+					byROC[rocNames[link] || ("ROC link " + link)] = hardwareMasks[link];
+				});
+			}
+		}
+		html += _rateExclusionLegend(exclusions, isROC ? [deviceUID] : rocLinks.map(function (link) {
+			return rocNames[link] || ("ROC link " + link);
+		}));
+		html += "<div style='overflow:auto;max-height:520px;margin-top:4px;'>";
 		html += "<table class='settings-table' " +
 			"style='width:auto;min-width:420px;font-size:inherit;'>";
 
@@ -1625,26 +1761,20 @@ var Mu2eHardware = Mu2eHardware || {};
 				"<td class='settings-name'><b>Total</b><br>kHz</td></tr>";
 			for (var channel = 0; channel < 96; ++channel) {
 				var rate = tables[0][channel];
+				var excluded = byROC[deviceUID] && byROC[deviceUID][channel];
 				html += "<tr><td class='settings-name'>" + channel + "</td>" +
-					"<td class='settings-value'>" + _esc(rate.hv) + "</td>" +
-					"<td class='settings-value'>" + _esc(rate.cal) + "</td>" +
-					"<td class='settings-value'>" + _esc(rate.total) + "</td></tr>";
+					_rateCellHTML(rate.hv, excluded) +
+					_rateCellHTML(rate.cal, excluded) +
+					_rateCellHTML(rate.total, excluded) + "</tr>";
 			}
 			return html + "</table></div>";
 		}
 
-		var rocLinks = _parseROCTargets(outputs["Target ROC"]);
-		if (!rocLinks || rocLinks.length !== tables.length) return "";
 		var returnCodes = _tryParseNumericArray(outputs["Return Code"]);
 		if (!returnCodes) {
 			var returnCode = Number(outputs["Return Code"]);
 			if (isFinite(returnCode)) returnCodes = [returnCode];
 		}
-
-		var rocNames = {};
-		var configuredROCs = Mu2eHardware.getROCsForDTC(deviceUID);
-		for (var r = 0; r < configuredROCs.length; ++r)
-			rocNames[configuredROCs[r].linkIndex] = configuredROCs[r].name;
 
 		html += "<tr><td class='settings-name'><b>Channel</b></td>";
 		for (var tableIndex = 0; tableIndex < tables.length; ++tableIndex) {
@@ -1659,9 +1789,11 @@ var Mu2eHardware = Mu2eHardware || {};
 
 		for (var dtcChannel = 0; dtcChannel < 96; ++dtcChannel) {
 			html += "<tr><td class='settings-name'>" + dtcChannel + "</td>";
-			for (var rocIndex = 0; rocIndex < tables.length; ++rocIndex)
-				html += "<td class='settings-value'>" +
-					_esc(tables[rocIndex][dtcChannel].total) + "</td>";
+			for (var rocIndex = 0; rocIndex < tables.length; ++rocIndex) {
+				var mask = byROC[rocNames[rocLinks[rocIndex]] || ("ROC link " + rocLinks[rocIndex])];
+				html += _rateCellHTML(
+					tables[rocIndex][dtcChannel].total, mask && mask[dtcChannel]);
+			}
 			html += "</tr>";
 		}
 
@@ -1898,7 +2030,7 @@ var Mu2eHardware = Mu2eHardware || {};
 					}
 					str += "<div class='macro-output-item'><div class='macro-output-name'>" +
 						_esc(name) + "</div><div class='macro-output-value'>" +
-						Mu2eHardware.colorizeValue(_esc(value)) + "</div></div>";
+						Mu2eHardware.colorizeValue(_esc(value), name) + "</div></div>";
 				}
 				str += "</div>";
 			} else {
@@ -1917,7 +2049,27 @@ var Mu2eHardware = Mu2eHardware || {};
 	// colorizeValue — apply status color coding to an output value string
 	// =========================================================================
 
-	Mu2eHardware.colorizeValue = function (value) {
+	Mu2eHardware.colorizeValue = function (value, outputName) {
+		// Return codes use zero for success, the opposite of an enabled bit.
+		// Keep the numbers and array structure visible, including single-ROC results.
+		if (/^\s*return\s+code\s*$/i.test(outputName || "")) {
+			var codes;
+			try {
+				codes = JSON.parse(value);
+			} catch (e) {
+				return value;
+			}
+			if (!Array.isArray(codes)) codes = [codes];
+			if (codes.length === 1 && Array.isArray(codes[0])) codes = codes[0];
+			if (!codes.length) return value;
+			for (var codeIndex = 0; codeIndex < codes.length; ++codeIndex)
+				if (typeof codes[codeIndex] !== "number" || !isFinite(codes[codeIndex]) ||
+					Math.floor(codes[codeIndex]) !== codes[codeIndex]) return value;
+			return value.replace(/-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g, function (code) {
+				return "<span class='" + (Number(code) === 0 ? "goodValue" : "badValue") +
+					"'>" + code + "</span>";
+			});
+		}
 		// Detect array-like values and render as bitmap
 		var bitmap = _tryParseBitArray(value);
 		if (bitmap)
@@ -1955,6 +2107,161 @@ var Mu2eHardware = Mu2eHardware || {};
 		return html;
 	};
 
+	// Get DTC Counters emits these decimal CSV rows in ROC-link order 0..5.
+	var TRACKER_COUNTER_ROWS = [
+		"TX EWM Count", "TX Data Request Count", "TX Heartbeat Count", "RX Data Header Count"
+	];
+
+	Mu2eHardware.parseDTCCounters = function (result) {
+		var parsed = {rows: {}, errors: []};
+		if (!result || result.error) {
+			parsed.errors.push(result && result.error ? String(result.error) : "No response received");
+			return parsed;
+		}
+		var reports = [];
+		(result.targets || []).forEach(function (target) {
+			var outputs = target.outputs || {};
+			Object.keys(outputs).forEach(function (key) {
+				if (_decodeURIComponentSafe(key) === "Performance Counters") reports.push(outputs[key]);
+			});
+		});
+		if (reports.length !== 1 || typeof reports[0] !== "string") {
+			parsed.errors.push("Missing or ambiguous Performance Counters output");
+			return parsed;
+		}
+		var matches = {};
+		reports[0].split(/\r?\n/).forEach(function (line) {
+			var separator = line.indexOf(":");
+			if (separator < 0) return;
+			var label = line.slice(0, separator).trim().replace(/\s+/g, " ");
+			if (TRACKER_COUNTER_ROWS.indexOf(label) < 0) return;
+			if (!matches[label]) matches[label] = [];
+			matches[label].push(line.slice(separator + 1).split(",").map(function (v) { return v.trim(); }));
+		});
+		TRACKER_COUNTER_ROWS.forEach(function (label) {
+			var rows = matches[label] || [];
+			if (rows.length !== 1 || rows[0].length !== 6 || !rows[0].every(function (v) {
+				return /^\d+$/.test(v) && Number(v) <= 0xFFFFFFFF;
+			})) {
+				parsed.errors.push(label + ": expected one row of six unsigned counter values");
+				return;
+			}
+			parsed.rows[label] = rows[0];
+		});
+		return parsed;
+	};
+
+	// Capture the same configured ROC enable flags used by the controls at read time.
+	Mu2eHardware.snapshotCounterLinks = function (targets) {
+		var byUID = Object.create(null);
+		(targets || []).forEach(function (uid) {
+			var links = [false, false, false, false, false, false];
+			Mu2eHardware.getROCsForDTC(uid).forEach(function (roc) {
+				if (Number.isInteger(roc.linkIndex) && roc.linkIndex >= 0 && roc.linkIndex < 6)
+					links[roc.linkIndex] = roc.enabled === true;
+			});
+			byUID[uid] = links;
+		});
+		return byUID;
+	};
+
+	Mu2eHardware.checkDTCCounters = function (result, enabledLinks) {
+		var parsed = Mu2eHardware.parseDTCCounters(result);
+		parsed.differences = [];
+		parsed.failedLinks = [];
+		for (var link = 0; link < 6; ++link) {
+			if (!enabledLinks || enabledLinks[link] !== true) continue;
+			if (!TRACKER_COUNTER_ROWS.every(function (label) { return !!parsed.rows[label]; })) continue;
+			var values = TRACKER_COUNTER_ROWS.map(function (label) { return Number(parsed.rows[label][link]); });
+			var difference = Math.max.apply(null, values) - Math.min.apply(null, values);
+			parsed.differences[link] = difference;
+			if (difference > 10) parsed.failedLinks.push(link);
+		}
+		parsed.success = parsed.errors.length === 0 && parsed.failedLinks.length === 0;
+		return parsed;
+	};
+
+	Mu2eHardware.formatTrackerCounters = function (targets, results, complete, enabledByUID) {
+		enabledByUID = enabledByUID || Mu2eHardware.snapshotCounterLinks(targets);
+		var byUID = Object.create(null), groups = Object.create(null), unmatched = [];
+		(results || []).forEach(function (item) {
+			byUID[item.uid] = Mu2eHardware.checkDTCCounters(item.result, enabledByUID[item.uid]);
+		});
+		(targets || []).forEach(function (uid) {
+			var match = /^Trk(\d+)_DTC([01])$/i.exec(uid);
+			if (!match) { unmatched.push(uid); return; }
+			var node = String(Number(match[1]));
+			if (!groups[node]) groups[node] = {name: uid.slice(0, uid.lastIndexOf("_")), dtcs: [null, null]};
+			groups[node].dtcs[Number(match[2])] = uid;
+		});
+		var html = "<div class='tracker-counter-note'>ROC links 0&ndash;5 for each DTC. " +
+			"Counts since last reset; DTCs are read independently. " +
+			"Grey: disabled or not configured (excluded from comparison). " +
+			"Red: an enabled ROC's largest and smallest counts differ by more than 10. " +
+			"Each DTC with a mismatch or read error counts once as failed.</div>";
+		Object.keys(groups).sort(function (a, b) { return Number(a) - Number(b); }).forEach(function (node) {
+			var group = groups[node];
+			function columnAttributes(col) {
+				var uid = group.dtcs[Math.floor(col / 6)], link = col % 6;
+				var enabled = uid && enabledByUID[uid] && enabledByUID[uid][link] === true;
+				var parsed = uid && byUID[uid];
+				var classes = link === 0 ? ["counter-dtc-start"] : [];
+				var title = "";
+				if (!enabled) {
+					classes.push("counter-disabled");
+					title = "Disabled or not configured; excluded from comparison";
+				} else if (parsed && parsed.failedLinks.indexOf(link) >= 0) {
+					classes.push("counter-mismatch");
+					title = "Counter difference " + parsed.differences[link] + " exceeds 10";
+				}
+				return (classes.length ? " class='" + classes.join(" ") + "'" : "") +
+					(title ? " title='" + title + "'" : "");
+			}
+			html += "<section class='tracker-counter-node'><h3>" + _esc(group.name) + "</h3>";
+			group.dtcs.forEach(function (uid, dtc) {
+				var parsed = uid && byUID[uid];
+				var note = !uid ? "DTC" + dtc + ": not included in this read" :
+					!parsed ? uid + (complete ? ": no response received" : ": pending") :
+					parsed.errors.length ? uid + ": " + parsed.errors.join("; ") : "";
+				if (note) html += "<div class='tracker-counter-note" +
+					((parsed && parsed.errors.length) || (uid && complete && !parsed) ? " badValue" : "") +
+					"'>" + _esc(note) + "</div>";
+				if (parsed && parsed.failedLinks.length)
+					html += "<div class='tracker-counter-note badValue'>" + _esc(uid) +
+						": " + parsed.failedLinks.map(function (link) {
+							return "ROC " + link + " difference " + parsed.differences[link];
+						}).join("; ") + " (limit 10)</div>";
+			});
+			html += "<div class='tracker-counters-scroll'><table class='tracker-counters-table' " +
+				"aria-label='" + _esc(group.name) + " performance counters'><thead><tr>" +
+				"<th rowspan='2' scope='col'>Counter</th>";
+			for (var dtc = 0; dtc < 2; ++dtc)
+				html += "<th colspan='6' scope='colgroup' class='counter-dtc-start'>" +
+					_esc(group.dtcs[dtc] || "DTC" + dtc + " (not included)") + "</th>";
+			html += "</tr><tr>";
+			for (var col = 0; col < 12; ++col)
+				html += "<th scope='col'" + columnAttributes(col) +
+					">ROC " + (col % 6) + "</th>";
+			html += "</tr></thead><tbody>";
+			TRACKER_COUNTER_ROWS.forEach(function (label) {
+				html += "<tr><th scope='row'>" + _esc(label) + "</th>";
+				for (var col = 0; col < 12; ++col) {
+					var uid = group.dtcs[Math.floor(col / 6)], parsed = uid && byUID[uid];
+					var values = parsed && parsed.rows[label];
+					var value = values ? values[col % 6] : uid && !parsed && !complete ? "Pending" : "N/A";
+					html += "<td" + columnAttributes(col) + ">" + _esc(value) + "</td>";
+				}
+				html += "</tr>";
+			});
+			html += "</tbody></table></div></section>";
+		});
+		unmatched.forEach(function (uid) {
+			html += "<div class='badValue'>Cannot place " + _esc(uid) +
+				" in a tracker table: expected a Trkxx_DTC0 or Trkxx_DTC1 UID.</div>";
+		});
+		return html;
+	};
+
 	// =========================================================================
 	// Promoted macros config — which macros to show as quick-action buttons
 	// =========================================================================
@@ -1981,6 +2288,7 @@ var Mu2eHardware = Mu2eHardware || {};
 			"ROC FEMacro - Read Panel ID",
 			"ROC FEMacro - Find Alignment",
 			"ROC FEMacro - Deserialize and set thresholds",
+			"ROC FEMacro - Find and serialize thresholds",
 			"ROC FEMacro - Measure Thresholds",
 		],
 	};
@@ -1999,12 +2307,15 @@ var Mu2eHardware = Mu2eHardware || {};
 		"ROC FEMacro - Read Serial Number",
 		"ROC FEMacro - Find Alignment",
 		"ROC FEMacro - Deserialize and set thresholds",
+		"ROC FEMacro - Find and serialize thresholds",
 		"ROC FEMacro - Measure Thresholds",
 	];
 
 	// Keys approved for fleet-wide buttons. Available keys are defined in
 	// HardwareOverview.html.
 	Mu2eHardware.ALL_TRACKER_BUTTON_ALLOWLIST = [
+		"counters",
+		"status",
 		"preflight",
 		"init-readout",
 		"link-status",
@@ -2012,6 +2323,7 @@ var Mu2eHardware = Mu2eHardware || {};
 		"reset-counters",
 		"find-alignment",
 		"set-thresholds",
+		"find-save-thresholds",
 	];
 
 	// =========================================================================
@@ -2019,6 +2331,8 @@ var Mu2eHardware = Mu2eHardware || {};
 	// =========================================================================
 
 	Mu2eHardware.macroDisplayName = function (name) {
+		if (name === "ROC FEMacro - Find and serialize thresholds")
+			return "Find & Save Thresholds";
 		if (name === "ROC FEMacro - Deserialize and set thresholds")
 			return "Set Thresholds";
 		if (name === "ROC FEMacro - Measure Channel Rates")
