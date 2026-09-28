@@ -4,6 +4,12 @@
 
 #include "otsdaq-mu2e-tracker/Ui/ROC.hh"
 
+#include <array>
+#include <exception>
+#include <format>
+#include <stdexcept>
+#include <string>
+
 namespace trkdaq{
     ROC::ROC(link_t link, DTCLib::DTC* dtc):
             _link(link),
@@ -65,6 +71,7 @@ namespace trkdaq{
                          uint16_t                       digitizationStart5ns,
                          uint16_t                       digitizationStop5ns,
                          uint8_t                        dtcId,
+                         uint16_t                       eventWindowDelay5ns,
                          const ControlRoc_Read_Input_t0& readSettings,
                          std::ostream&                  output){
         auto rv = _dtc->InitReadoutROC(
@@ -73,6 +80,7 @@ namespace trkdaq{
                 dtcId,
                 digitizationStart5ns,
                 digitizationStop5ns,
+                eventWindowDelay5ns,
                 readSettings,
                 output);
         return rv;
@@ -241,8 +249,115 @@ namespace trkdaq{
         return rv;
     }
 
+    ControlRoc_DeviceID_t ROC::ReadDeviceInfo(){
+        ControlRoc_DeviceID_t info;
+        const int rc = _dtc->ReadDeviceID(_link, info, 0, _null);
+        if (rc != 0)
+            throw std::runtime_error(std::format(
+                "READDEVICE failed for ROC link {} (return code {}).", _link, rc));
+        return info;
+    }
+
+    std::string ROC::ReadFirmwareGitCommit(){
+        std::string commit;
+        const int rc = _dtc->ReadGitCommit(commit, _link, 0, _null);
+        // READGITREV returns the 40 ASCII hex characters of LAST_GIT_REV.
+        // Also reject READ_ERROR: older low-level code can return rc=0 on failure.
+        if (rc != 0 || commit.size() != 40 ||
+            commit.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+            throw std::runtime_error(std::format(
+                "READGITREV failed or returned a malformed Git revision for ROC link {} "
+                "(return code {}, {} characters).", _link, rc, commit.size()));
+        return commit;
+    }
+
+    uint32_t ROC::ReadUserCode(){
+        constexpr int readUserCode = 0x118; // ROC/utils.h: READUSERCODE = 280
+        if (_link < 0 || _link >= 6)
+            throw std::runtime_error(std::format("READUSERCODE: invalid ROC link {}.", _link));
+        std::vector<uint16_t> data;
+        const int rc = _dtc->RocBlockRead(_link, readUserCode, data, 4);
+        if (rc != 0 || data.size() != 4)
+            throw std::runtime_error(std::format(
+                "READUSERCODE failed for ROC link {} (return code {}, {} payload words; "
+                "expected 4).", _link, rc, data.size()));
+        uint32_t userCode = 0;
+        // SYS_get_user_code returns the least-significant byte first.
+        // See ROC/iaputils.c::execute_usercode_service for the MSB-first display.
+        for (size_t i = 0; i < data.size(); ++i) {
+            if (data[i] > 0xff)
+                throw std::runtime_error(std::format(
+                    "READUSERCODE: non-byte payload word {} for ROC link {}.", i, _link));
+            userCode |= static_cast<uint32_t>(data[i]) << (8 * i);
+        }
+        return userCode;
+    }
+
     int ROC::FindAlignment(){
-        auto rv = _dtc->FindAlignment(DTCLib::DTC_Link_ID(_link), _alignment);
+        // Alignment enables every channel. Save the raw hardware words first;
+        // restoring them must not apply the logical-channel mapping again.
+        const std::array<int, 3> maskAddresses = {
+            registers::digi::channel_mask_lo,
+            registers::digi::channel_mask_md,
+            registers::digi::channel_mask_hi};
+        const std::array<int, 2> digis = {fpga::digi::cal, fpga::digi::hv};
+        std::array<std::array<uint16_t, 3>, 2> savedMasks{};
+        for (size_t digi = 0; digi < digis.size(); ++digi) {
+            for (size_t word = 0; word < maskAddresses.size(); ++word) {
+                uint32_t value = 0;
+                const int rc = this->DigiRead(maskAddresses[word], digis[digi],
+                                             value, 0, _null);
+                if (rc != 0 || value > 0xffffu)
+                    throw std::runtime_error(std::format(
+                        "FindAlignment: cannot save mask, link {} DIGI {} register 0x{:02x}, rc {}",
+                        _link, digis[digi], maskAddresses[word], rc));
+                savedMasks[digi][word] = static_cast<uint16_t>(value);
+            }
+        }
+
+        // A failed alignment may already have changed masks. Defer its error
+        // until all six restoration attempts and their readbacks are complete.
+        std::exception_ptr alignmentError;
+        int rv = 0;
+        try {
+            rv = _dtc->FindAlignment(DTCLib::DTC_Link_ID(_link), _alignment);
+        }
+        catch (...) {
+            alignmentError = std::current_exception();
+        }
+
+        std::exception_ptr restoreError;
+        for (size_t digi = 0; digi < digis.size(); ++digi) {
+            for (size_t word = 0; word < maskAddresses.size(); ++word) {
+                try {
+                    const int writeRc = this->DigiWrite(maskAddresses[word], digis[digi],
+                                                       savedMasks[digi][word], 0, _null);
+                    uint32_t value = 0;
+                    const int readRc = this->DigiRead(maskAddresses[word], digis[digi],
+                                                    value, 0, _null);
+                    if (writeRc != 0 || readRc != 0 || value != savedMasks[digi][word])
+                        throw std::runtime_error(std::format(
+                            "link {} DIGI {} register 0x{:02x}: expected 0x{:04x}, read 0x{:04x}, write rc {}, read rc {}",
+                            _link, digis[digi], maskAddresses[word], savedMasks[digi][word],
+                            value, writeRc, readRc));
+                }
+                catch (...) {
+                    if (!restoreError) restoreError = std::current_exception();
+                }
+            }
+        }
+        if (restoreError) {
+            const auto describe = [](std::exception_ptr error) -> std::string {
+                try { std::rethrow_exception(error); }
+                catch (const std::exception& ex) { return ex.what(); }
+                catch (...) { return "unknown exception"; }
+            };
+            throw std::runtime_error(
+                "FindAlignment: mask restoration failed: " + describe(restoreError) +
+                (alignmentError ? "; alignment also failed: " + describe(alignmentError)
+                                : std::format("; alignment rc {}", rv)));
+        }
+        if (alignmentError) std::rethrow_exception(alignmentError);
         return rv;
     }
 
@@ -265,8 +380,8 @@ namespace trkdaq{
                             int preamp,
                             float threshold_mv,
                             float tolerance_mv,
-                            DTCLib::roc_data_t& out){
-        auto rv = _dtc->FindThreshold(_link, channel, preamp, threshold_mv, tolerance_mv, out);
+                            DTCLib::roc_data_t& out, ThresholdSearchResult* detail){
+        auto rv = _dtc->FindThreshold(_link, channel, preamp, threshold_mv, tolerance_mv, out, detail);
         return rv;
     }
 
@@ -284,16 +399,23 @@ namespace trkdaq{
 
     int ROC::FindThresholds(float threshold_mv,
                             float tolerance_mv,
-                            std::vector<DTCLib::roc_data_t>& out){
-        out.assign(2 * 96, 0);
+                            std::vector<DTCLib::roc_data_t>& out,
+                            std::vector<ThresholdSearchResult>* details,
+                            const std::function<void(size_t, size_t)>& progress){
+        out.clear();
+        if (details) details->clear();
+        if (progress) progress(0, 192);
         int n_failed = 0;
-        for (int channel = 0; channel < 96; channel++){
-            DTCLib::roc_data_t cal_dac = 0;
-            DTCLib::roc_data_t hv_dac  = 0;
-            n_failed += this->FindThresholds(channel, threshold_mv, tolerance_mv, cal_dac, hv_dac);
-            out[2*channel + 0] = cal_dac;  // CAL
-            out[2*channel + 1] = hv_dac;   // HV
-        }
+        for (int channel = 0; channel < 96; ++channel)
+            for (int preamp = 0; preamp < 2; ++preamp) {
+                DTCLib::roc_data_t dac;
+                ThresholdSearchResult detail;
+                if (!FindThreshold(channel, preamp, threshold_mv, tolerance_mv, dac, &detail))
+                    ++n_failed;
+                out.push_back(dac);
+                if (details) details->push_back(detail);
+                if (progress) progress(out.size(), 192);
+            }
         return n_failed;
     }
 
@@ -369,7 +491,8 @@ namespace trkdaq{
     return rv;
   }
 
-  int ROC::ChannelRates(uint16_t tdc_mode, std::vector<rates_t>& rates){
+  int ROC::ChannelRates(uint16_t tdc_mode, std::vector<rates_t>& rates,
+                        std::array<uint16_t, 6>* masksBeforeRead){
     // hardcoded defaults for the rarely-changed parameters
     uint16_t adc_mode      = 0;
     uint16_t num_lookback  = 0;
@@ -383,30 +506,85 @@ namespace trkdaq{
     uint16_t mode          = 0;
     uint16_t clock         = 99;
 
-    // first, dummy read to switch the marker source
-    this->NotoriousRead(adc_mode,
-                        tdc_mode,
-                        num_lookback,
-                        num_samples,
-                        num_triggers,
-                        mask_lo,
-                        mask_md,
-                        mask_hi,
-                        enable_pulser,
-                        marker_clock,
-                        mode,
-                        clock,
-                        _null);
+    // Save raw DIGI masks before NotoriousRead enables every channel. These
+    // are already in hardware channel order; do not remap them on restoration.
+    rates.clear();
+    const std::array<int, 3> maskAddresses = {
+        registers::digi::channel_mask_lo,
+        registers::digi::channel_mask_md,
+        registers::digi::channel_mask_hi};
+    const std::array<int, 2> digis = {fpga::digi::cal, fpga::digi::hv};
+    std::array<std::array<uint16_t, 3>, 2> savedMasks{};
+    for (size_t digi = 0; digi < digis.size(); ++digi) {
+      for (size_t word = 0; word < maskAddresses.size(); ++word) {
+        uint32_t value = 0;
+        const int rc = this->DigiRead(maskAddresses[word], digis[digi],
+                                     value, 0, _null);
+        if (rc != 0 || value > 0xffffu)
+          throw std::runtime_error(std::format(
+              "ChannelRates: cannot save mask, link {} DIGI {} register 0x{:02x}, rc {}",
+              _link, digis[digi], maskAddresses[word], rc));
+        savedMasks[digi][word] = static_cast<uint16_t>(value);
+      }
+    }
 
-    // next, query the rates
-    ControlRoc_Rates_t par;
-    int print_level = 0;
+    // Keep the acquisition exception until all six masks have been restored.
+    // A setup failure may occur after it has already changed some registers.
+    std::exception_ptr acquisitionError;
+    int rv = 0;
     std::vector<uint16_t> readings;
-    auto rv = _dtc->Rates(_link, &readings, print_level, &par, _null);
+    try {
+      rv = this->NotoriousRead(adc_mode, tdc_mode, num_lookback, num_samples,
+                               num_triggers, mask_lo, mask_md, mask_hi,
+                               enable_pulser, marker_clock, mode, clock, _null);
+      if (rv == 0) {
+        ControlRoc_Rates_t par;
+        rv = _dtc->Rates(_link, &readings, 0, &par, _null);
+      }
+    }
+    catch (...) {
+      acquisitionError = std::current_exception();
+    }
 
-    // there is no exposed decoding of the actual rates in the underlying
-    // interface. so, unfortunately, we have to duplicate the mathematics here.
-    // TODO throw on readings.size() != 580
+    // Attempt every restoration even if one write/readback fails.
+    std::exception_ptr restoreError;
+    for (size_t digi = 0; digi < digis.size(); ++digi) {
+      for (size_t word = 0; word < maskAddresses.size(); ++word) {
+        try {
+          const int writeRc = this->DigiWrite(maskAddresses[word], digis[digi],
+                                              savedMasks[digi][word], 0, _null);
+          uint32_t value = 0;
+          const int readRc = this->DigiRead(maskAddresses[word], digis[digi],
+                                           value, 0, _null);
+          if (writeRc != 0 || readRc != 0 || value != savedMasks[digi][word])
+            throw std::runtime_error(std::format(
+                "link {} DIGI {} register 0x{:02x}: expected 0x{:04x}, read 0x{:04x}, write rc {}, read rc {}",
+                _link, digis[digi], maskAddresses[word], savedMasks[digi][word],
+                value, writeRc, readRc));
+        }
+        catch (...) {
+          if (!restoreError) restoreError = std::current_exception();
+        }
+      }
+    }
+    if (restoreError) {
+      const auto describe = [](std::exception_ptr error) -> std::string {
+        try { std::rethrow_exception(error); }
+        catch (const std::exception& ex) { return ex.what(); }
+        catch (...) { return "unknown exception"; }
+      };
+      throw std::runtime_error(
+          "ChannelRates: mask restoration failed: " + describe(restoreError) +
+          (acquisitionError ? "; acquisition also failed: " + describe(acquisitionError)
+                            : std::format("; acquisition rc {}", rv)));
+    }
+    if (acquisitionError) std::rethrow_exception(acquisitionError);
+    if (rv != 0) return rv;
+    if (readings.size() != 580)
+      throw std::runtime_error(std::format(
+          "ChannelRates: expected 580 rate words, received {}", readings.size()));
+
+    // Decode only after hardware masks have been restored successfully.
     float period = 5e-9; // 200 MHz clock <-> 5 ns tick spacing
     uint32_t ticks_lo = readings[578] + (readings[579] << 16); // lower 48 channels
     uint32_t ticks_hi = readings[576] + (readings[577] << 16); // upper 48 channels
@@ -433,6 +611,12 @@ namespace trkdaq{
       rates[i] = std::make_tuple(rate_hiv, rate_cal, rate_coi);
     }
 
+    if (masksBeforeRead) {
+      // CAL then HV, each in register order 0x0B, 0x0E, 0x0D.
+      for (size_t digi = 0; digi < savedMasks.size(); ++digi)
+        for (size_t word = 0; word < savedMasks[digi].size(); ++word)
+          (*masksBeforeRead)[3 * digi + word] = savedMasks[digi][word];
+    }
     return rv;
   }
 

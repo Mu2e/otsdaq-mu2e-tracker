@@ -65,6 +65,11 @@ public:
     int         index;                  // in spi_offsets and bin_offsets
     ImageData_t spi_file;
     ImageData_t bin_file;
+    // Required for verified activation; catalog values are hexadecimal strings.
+    std::string expected_design_version;
+    std::string expected_usercode;
+    std::string expected_git_commit; // required when bin_file.load_flag > 0
+
   };
 
   int kSPI_CLEAR_SLEEP_US;
@@ -118,11 +123,11 @@ public:
 
   int  spi_write_record         (trkdaq::DtcInterface* Dtc_i, int Link, int FirstAddr   , int NWords, uint16_t* Data, int DebugMode = 0);
   int  spi_write_segment        (trkdaq::DtcInterface* Dtc_i, int Link, const char* Data, int NBytes, int SpiOffset , int DebugMode = 0);
-  int  spi_write_image          (trkdaq::DtcInterface* Dtc_i, int Link, const program_drac::ImageData_t* SpiData, int DebugMode = 0);
+  int  spi_write_image          (trkdaq::DtcInterface* Dtc_i, int Link, const program_drac::ImageData_t* SpiData, int DebugMode = 0x10000);
 
                                         // this one only uploads image to SPI memory, but doesn't program the FPGA
 
-  int  spi_write_version        (trkdaq::DtcInterface* Dtc_i, int Link, const std::string& Version, int DebugMode = 0);
+  int  spi_write_version        (trkdaq::DtcInterface* Dtc_i, int Link, const std::string& Version, int DebugMode = 0x10000);
 
                                         // tests
 

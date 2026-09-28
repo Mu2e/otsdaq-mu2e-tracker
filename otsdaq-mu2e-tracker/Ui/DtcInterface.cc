@@ -331,7 +331,7 @@ namespace trkdaq {
 
 //-----------------------------------------------------------------------------
 // Tracker-only, per-ROC subset of MIDAS InitReadout.  SharedDtcInterface holds
-// its mutex around this entire function, so the reset/configure/clear/ID/window
+// its mutex around this entire function, so the reset/configure/clear/ID/delay/window
 // sequence cannot interleave with another ROC command on the same DTC.
 //-----------------------------------------------------------------------------
   int DtcInterface::InitReadoutROC(int                            Link,
@@ -339,11 +339,20 @@ namespace trkdaq {
                                    int                            DtcID,
                                    uint16_t                       DigitizationStart5ns,
                                    uint16_t                       DigitizationStop5ns,
+                                   uint16_t                       EventWindowDelay5ns,
                                    const ControlRoc_Read_Input_t0& ReadSettings,
                                    std::ostream&                  Stream) {
     if ((Link < 0) or (Link > 5)) {
       Stream << std::format("ERROR: invalid ROC link {}; expected 0-5\n",Link);
       return -1;
+    }
+
+    // Reject truncation by the 10-bit tracker delay register before any writes.
+    if (EventWindowDelay5ns > 0x3ffu) {
+      Stream << std::format(
+          "ERROR: event-window delay {} is outside 0-1023 (5 ns units)\n",
+          EventWindowDelay5ns);
+      return -3;
     }
 
     fRocReadoutMode = RocReadoutMode;
@@ -473,6 +482,20 @@ namespace trkdaq {
       return rc;
     }
 
+    // Match MIDAS SetRocDelay: register 4, in 5 ns units, after reset and
+    // before the digitization window. Keep write/readback under the same lock.
+    fDtc->WriteROCRegister(rocLink,4,EventWindowDelay5ns,false,100);
+    std::this_thread::sleep_for(std::chrono::microseconds(fSleepTimeROCReset));
+    const uint16_t eventWindowDelayReadback =
+        fDtc->ReadROCRegister(rocLink,4,100);
+    Stream << std::format(
+        "ROC event-window delay: R4 wrote {}, read {} (5 ns units)\n",
+        EventWindowDelay5ns,eventWindowDelayReadback);
+    if (eventWindowDelayReadback != EventWindowDelay5ns) {
+      Stream << "ERROR: ROC register-4 event-window delay readback mismatch\n";
+      return -4;
+    }
+
     rc = SetRocDigitizationWindow(
         Link,DigitizationStart5ns,DigitizationStop5ns,0,Stream);
     if (rc != 0) {
@@ -485,10 +508,11 @@ namespace trkdaq {
   }
 
 //-----------------------------------------------------------------------------
-// If an enabled ROC receive lane is not empty or is full, reset only that
+// Require B6 alignment even when R18 reports empty receive FIFOs.
+// If an enabled ROC receive lane is unaligned, not empty, or full, reset that
 // lane's PCS and PMA through active-low ROC register B5.  After releasing the
 // SERDES reset, wait for alignment, clear the ROC receive FIFOs, and recheck
-// R18 once before failing initialization.
+// R18 once. Initialization requires both alignment and FIFO readiness.
 //-----------------------------------------------------------------------------
   int DtcInterface::EnsureDigiRxLanesReady(int            Link,
                                            uint16_t       EnabledLanes,
@@ -516,13 +540,6 @@ namespace trkdaq {
     };
 
     const uint16_t initialStatus = readLaneStatus();
-    if (lanesReady(initialStatus)) {
-      Stream << std::format("ROC DIGI lanes ready: R18=0x{:04x}\n",initialStatus);
-      return 0;
-    }
-
-    const uint16_t initialEmpty = (initialStatus >> 8) & 0xf;
-    const uint16_t initialFull  = (initialStatus >> 4) & 0xf;
     uint16_t initialAlignment = 0;
     if (readInternalRegister(0xb6,initialAlignment) != 0) {
       const std::string message = std::format(
@@ -532,6 +549,16 @@ namespace trkdaq {
       return -3;
     }
     initialAlignment &= 0xf;
+    if (lanesReady(initialStatus) and
+        (initialAlignment & EnabledLanes) == EnabledLanes) {
+      Stream << std::format(
+          "ROC DIGI lanes ready: enabled:0x{:x} B6:0x{:x} R18=0x{:04x}\n",
+          EnabledLanes,initialAlignment,initialStatus);
+      return 0;
+    }
+
+    const uint16_t initialEmpty = (initialStatus >> 8) & 0xf;
+    const uint16_t initialFull  = (initialStatus >> 4) & 0xf;
     const uint16_t failingLanes =
         EnabledLanes &
         (static_cast<uint16_t>((~initialEmpty) & 0xf) | initialFull |
@@ -569,11 +596,15 @@ namespace trkdaq {
     }
 
     uint16_t alignment = 0;
+    bool allEnabledAligned = false;
     for (int attempt=0; attempt<50; ++attempt) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       if (readInternalRegister(0xb6,alignment) != 0) continue;
       alignment &= 0xf;
-      if ((alignment & EnabledLanes) == EnabledLanes) break;
+      if ((alignment & EnabledLanes) == EnabledLanes) {
+        allEnabledAligned = true;
+        break;
+      }
     }
 
     fDtc->WriteROCRegister(rocLink,13,1,false,1000);
@@ -582,8 +613,6 @@ namespace trkdaq {
     std::this_thread::sleep_for(std::chrono::microseconds(fSleepTimeROCWrite));
 
     const uint16_t finalStatus = readLaneStatus();
-    const bool allEnabledAligned =
-        (alignment & EnabledLanes) == EnabledLanes;
     if (not lanesReady(finalStatus) or not allEnabledAligned) {
       const uint16_t finalEmpty = (finalStatus >> 8) & 0xf;
       const uint16_t finalFull  = (finalStatus >> 4) & 0xf;
@@ -1801,57 +1830,48 @@ int DtcInterface::ValidateVarPatterns  (ushort* DtcData, ulong EwTag, ulong* Off
 
 //-----------------------------------------------------------------------------
 // ejc
-  float DtcInterface::ProgramAndQueryThreshold(const int Link,
-                                               const int ChannelID,
-                                               const int PreampType,
-                                               const DTCLib::roc_data_t dac){
-    uint32_t mask_lo = 0x00000000;
-    uint32_t mask_md = 0x00000000;
-    uint32_t mask_hi = 0x00000000;
-    if (ChannelID < 32){
-      mask_lo += (1 << (ChannelID -  0));
-    }
-    else if (ChannelID < 64){
-      mask_md += (1 << (ChannelID - 32));
-    }
-    else if (ChannelID < 96){
-      mask_hi += (1 << (ChannelID - 64));
-    }
+  float DtcInterface::QueryThreshold(int Link, int ChannelID, int PreampType) {
+    if (Link < 0 || Link > 5 || ChannelID < 0 || ChannelID > 95 ||
+        (PreampType != 0 && PreampType != 1))
+      throw std::invalid_argument("Invalid link/channel/preamp for threshold measurement.");
+    uint32_t masks[3] = {0, 0, 0};
+    masks[ChannelID / 32] = uint32_t(1) << (ChannelID % 32);
     std::vector<float> queried;
-    queried.reserve(96);
-    this->ControlRoc_SetThreshold(Link, ChannelID, PreampType, dac);
-    this->ControlRoc_ReadThresholds(Link, queried, mask_lo, mask_md, mask_hi);
-    auto idx = 3*ChannelID + (1 - PreampType);
-    auto rv = queried.at(idx);
-    return rv;
+    const int rc = ControlRoc_ReadThresholds(Link, queried, masks[0], masks[1], masks[2]);
+    if (rc != 0 || queried.size() != 288)
+      throw std::runtime_error(std::format("Threshold read failed (rc={}, values={}).", rc, queried.size()));
+    return queried.at(3 * ChannelID + (1 - PreampType));
   }
 
-//-----------------------------------------------------------------------------
-  bool DtcInterface::FindThreshold(const int Link,
-                                   const int ChannelID,
-                                   const int PreampType,
-                                   const float threshold,
-                                   const float tolerance,
-                                   DTCLib::roc_data_t& out){
-    roc_data_t lower = 0;
-    roc_data_t upper = 1023;
-    auto f = [this, Link, ChannelID, PreampType] (roc_data_t dac){
-      this->ControlRoc_SetThreshold(Link, ChannelID, PreampType, dac);
-      auto rv = this->ProgramAndQueryThreshold(Link, ChannelID, PreampType, dac);
-      return rv;
-    };
+  float DtcInterface::ProgramAndQueryThreshold(int Link, int ChannelID,
+                                               int PreampType, DTCLib::roc_data_t dac) {
+    if (ControlRoc_SetThreshold(Link, ChannelID, PreampType, dac) != 0)
+      throw std::runtime_error("Threshold DAC write failed.");
+    return QueryThreshold(Link, ChannelID, PreampType);
+  }
 
-    auto dac = bisection_search(f, -threshold, tolerance, lower, upper);
-    auto measured = this->ProgramAndQueryThreshold(Link, ChannelID, PreampType, dac);
-
-    // return whether or not the search was successful
-    auto rv = false;
-    if (fabs((-measured) - threshold) < tolerance){
-      rv = true;
-      out = dac;
+  bool DtcInterface::FindThreshold(int Link, int ChannelID, int PreampType,
+                                   float threshold, float tolerance,
+                                   DTCLib::roc_data_t& out, ThresholdSearchResult* detail) {
+    if (Link < 0 || Link > 5 || ChannelID < 0 || ChannelID > 95 ||
+        (PreampType != 0 && PreampType != 1))
+      throw std::invalid_argument("Invalid link/channel/preamp for threshold search.");
+    try {
+      const auto result = SearchThreshold(threshold, tolerance,
+          [&](int dac) {
+            if (ControlRoc_SetThreshold(Link, ChannelID, PreampType, dac) != 0)
+              throw std::runtime_error("Threshold DAC write failed.");
+          },
+          [&]() { return QueryThreshold(Link, ChannelID, PreampType); });
+      out = static_cast<DTCLib::roc_data_t>(result.dac);
+      if (detail) *detail = result;
+      return result.success();
+    } catch (const std::exception& e) {
+      // Abort the scan on communication errors; do not continue programming a
+      // ROC whose command completion or readback is no longer trustworthy.
+      throw std::runtime_error(std::format("Threshold search link={} channel={} preamp={}: {}",
+                               Link, ChannelID, PreampType, e.what()));
     }
-
-    return rv;
   }
 
 //-----------------------------------------------------------------------------

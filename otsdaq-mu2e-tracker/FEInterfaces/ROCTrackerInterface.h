@@ -25,7 +25,6 @@
 
 #include "otsdaq-mu2e-tracker/Ui/ROC.hh"
 
-#include <mutex>
 #include <nlohmann/json.hpp>
 
 namespace ots
@@ -61,6 +60,7 @@ public:
 	virtual void onDTCReady();
 
 	using address_t = trkdaq::ROC::address_t;
+	std::string getFirmwareVersion(void) override;
 	void InitReadout(__ARGS__);
 	void ReadRegister(__ARGS__);
 	void ResetCounters(__ARGS__);
@@ -192,6 +192,8 @@ private:
 	    const std::string& Text);
 
 	std::array<uint32_t, 3> GetConfiguredChannelMasks() const;
+	std::string ResolveThresholdFilePath(
+	    const std::string& rootOverride = "", const std::string& setOverride = "");
 
   // format a per-channel rates table from a vector-of-tuples
   // returned by trkdaq::ROC::ChannelRates
@@ -203,7 +205,6 @@ private:
 	static nlohmann::json SafeDeserialize(std::string path,
 													              std::string key);
 
-	static std::mutex _json_filesystem_mutex;
 	// clang-format on
 };
 }  // namespace ots

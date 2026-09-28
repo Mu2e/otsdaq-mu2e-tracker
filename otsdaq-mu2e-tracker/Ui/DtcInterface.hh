@@ -29,6 +29,7 @@
 #include "otsdaq-mu2e-tracker/Ui/ProgramRoc.hh"
 
 #include "otsdaq-mu2e-tracker/Ui/BisectionSearch.hh"
+#include "otsdaq-mu2e-tracker/Ui/ThresholdSearch.hh"
 
 namespace trkdaq {
   using roc_serial_t = std::string;
@@ -224,13 +225,16 @@ namespace trkdaq {
                                const int           PreampType  ,
                                const float         threshold_mv,
                                const float         tolerance_mv,
-                               DTCLib::roc_data_t& out         );
+                               DTCLib::roc_data_t& out,
+                               ThresholdSearchResult* result = nullptr);
 
     bool         FindThreshold(const int   Link,
                                const int   ChannelID,
                                const int   PreampType,
                                const float threshold_mv,
                                const float tolerance_mv);
+
+    float        QueryThreshold(int Link, int ChannelID, int PreampType);
 
     float        ProgramAndQueryThreshold(const int Link,
                                           const int ChannelID,
@@ -254,6 +258,7 @@ namespace trkdaq {
                                                     int                            DtcID,
                                                     uint16_t                       DigitizationStart5ns,
                                                     uint16_t                       DigitizationStop5ns,
+                                                    uint16_t                       EventWindowDelay5ns,
                                                     const ControlRoc_Read_Input_t0& ReadSettings,
                                                     std::ostream&                  Stream = std::cout);
     int                              EnsureDigiRxLanesReady(int            Link,

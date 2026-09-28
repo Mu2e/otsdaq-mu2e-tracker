@@ -704,7 +704,12 @@ namespace  trkdaq {
 
                                         // 0x86 = 0x82 + 4
     uint16_t u;
-    while ((u = fDtc->ReadROCRegister(roc,128,100)) != 0x8000) {};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while ((u = fDtc->ReadROCRegister(roc,128,100)) != 0x8000) {
+        if (std::chrono::steady_clock::now() >= deadline)
+          throw std::runtime_error("Threshold command timed out waiting for ROC R128.");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
     TLOG(TLVL_DEBUG+1) << Form("reg:%03i val:0x%04x\n",128,u);
 //-----------------------------------------------------------------------------
 // register 129: number of words to read, currently-  (+ 4) (ask Monica)
@@ -712,10 +717,13 @@ namespace  trkdaq {
     int nw = fDtc->ReadROCRegister(roc,129,100);
     TLOG(TLVL_DEBUG+1) << Form("reg:%03i val:0x%04x\n",129,nw);
 
+    if (nw < 4) throw std::runtime_error("Invalid threshold write reply length.");
     nw = nw-4;
     std::vector<uint16_t> v2;
     fDtc->ReadROCBlock(v2,roc,REG_SET_THR,nw,false,100);
 
+    if (v2.size() != static_cast<size_t>(nw))
+      throw std::runtime_error("Truncated threshold write reply.");
     if (PrintLevel != 0) PrintBuffer(v2.data(),nw);
 //-----------------------------------------------------------------------------
 //
@@ -827,12 +835,31 @@ namespace  trkdaq {
     std::this_thread::sleep_for(std::chrono::microseconds(fSleepTimeROCWrite));
 
     // 0x86 = 0x82 + 4
-    uint16_t u;
+    uint16_t u = 0;
+    unsigned selectedChannels = 0;
+    for (uint32_t word : mask)
+      for (; word; word &= word - 1) ++selectedChannels;
+    // A full-panel measurement previously took about 8.4 seconds including
+    // transport. Keep a short bound for single-channel calibration probes, but
+    // allow multi-channel measurements to finish their sequential ADC work.
+    const auto completionTimeout = std::chrono::seconds(selectedChannels > 1 ? 30 : 5);
     try {
-      while ((u = fDtc->ReadROCRegister(roc,128,100)) != 0x8000) {};
+      const auto deadline = std::chrono::steady_clock::now() + completionTimeout;
+      while ((u = fDtc->ReadROCRegister(roc,128,100)) != 0x8000) {
+        if (std::chrono::steady_clock::now() >= deadline)
+          throw std::runtime_error(std::format(
+              "Threshold measurement on link {} timed out after {} s ({} selected channels, R128=0x{:04x}).",
+              Link, completionTimeout.count(), selectedChannels, u));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
       if (PrintLevel & 0x1) {
         Stream << std::format("reg:{:03d} val:0x{:04x}",128,u) << std::endl;
       }
+    }
+    catch(const std::exception& error) {
+      TLOG(TLVL_ERROR) << "threshold R128 completion/read failed: " << error.what();
+      Stream << "Threshold R128 completion/read failed: " << error.what() << std::endl;
+      return -1;
     }
     catch(...) {
       TLOG(TLVL_ERROR) << "failure to read R128";
@@ -859,6 +886,10 @@ namespace  trkdaq {
 // read raw numbers
 // expect nw=288 = 96*3, if not - in trouble
 //-----------------------------------------------------------------------------
+    if (nw != 292) {
+      Stream << "Invalid threshold reply word count: " << nw << " (expected 292)\n";
+      return -4;
+    }
     nw = nw-4;
     std::vector<uint16_t> v2;
     try {
@@ -870,6 +901,10 @@ namespace  trkdaq {
       return -3;
     }
 
+    if (v2.size() != 288) {
+      Stream << "Truncated threshold reply: " << v2.size() << " words\n";
+      return -5;
+    }
     if (PrintLevel & 0x1) PrintBuffer(v2.data(),nw,0x0,Stream);
 //-----------------------------------------------------------------------------
 // convert to floats
@@ -1231,7 +1266,25 @@ namespace  trkdaq {
                                              int                    PrintLevel,
                                              std::ostream&          Stream    ) {
 
+    DevId = {};
+    if (Link < 0 || Link >= 6 || !LinkEnabled(Link)) {
+      Stream << "READDEVICE: invalid or disabled ROC link " << Link << '\n';
+      return -1;
+    }
+
     std::vector<uint16_t> dat = ReadDeviceID(DTC_Link_ID(Link));
+    // READDEVICE contains 52 byte values, each transported in a 16-bit word.
+    // Validate before indexing; a short reply must not access past the vector.
+    if (dat.size() != 52) {
+      Stream << "READDEVICE: expected 52 payload words, received " << dat.size() << '\n';
+      return -1;
+    }
+    for (const auto value : dat) {
+      if (value > 0xff) {
+        Stream << "READDEVICE: payload word is not a byte value\n";
+        return -1;
+      }
+    }
 
     std::stringstream ss;
     // first 16 bytes are the serial number
