@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "otsdaq-mu2e-tracker/FEInterfaces/ROCTrackerInterface.h"
+#include "otsdaq-mu2e-tracker/FEInterfaces/TrackerRatePublisher.h"
 #include "otsdaq/ConfigurationInterface/ConfigurationManagerRW.h"
 #include "otsdaq/Macros/InterfacePluginMacros.h"
 
@@ -356,6 +357,15 @@ ROCTrackerInterface::ROCTrackerInterface(
 	                        std::vector<std::string>{"Output"},
 	                        1,
 	                        "" /* tooltip info here */);
+
+	registerFEMacroFunction("Publish Rate Summary",
+	                        static_cast<FEVInterface::frontEndMacroFunction_t>(
+	                            &ROCTrackerInterface::PublishRateSummary),
+	                        std::vector<std::string>{"Summary JSON"},
+	                        std::vector<std::string>{"Published"},
+	                        1,
+	                        "Send a validated complete tracker rate summary to Graphite for Grafana. "
+	                        "No ROC/DTC hardware access. Published=1 confirms TCP send, not database storage.");
 
   registerFEMacroFunction("Measure Channel Rates",
                           static_cast<FEVInterface::frontEndMacroFunction_t>(
@@ -1544,6 +1554,14 @@ std::string ROCTrackerInterface::FormatRatesTable(
 		    " {:4d} {:11.3f} {:11.3f} {:11.3f}\n", channel, cal, hiv, coi);
 	}
 	return table.str();
+}
+
+void ROCTrackerInterface::PublishRateSummary(__ARGS__)
+{
+	const auto summary = __GET_ARG_IN__("Summary JSON", std::string, "");
+	const auto lines    = tracker_rates::graphiteLines(summary, std::time(nullptr));
+	tracker_rates::sendGraphite(lines);
+	__SET_ARG_OUT__("Published", "1");
 }
 
 void ROCTrackerInterface::MeasureChannelRates(__ARGS__)

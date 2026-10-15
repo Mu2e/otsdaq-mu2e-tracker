@@ -94,6 +94,21 @@ var Mu2eHardware = Mu2eHardware || {};
 
 	Mu2eHardware.fetchStructure = function (callback) {
 		Debug.log("Mu2eHardware.fetchStructure()");
+		// Tracker uses linked-table discovery because the deployed DTC plugin's
+		// Context initialization cache can return {apps: []} for valid tables.
+		if (typeof TrackerRateMask !== "undefined") {
+			TrackerRateMask.browserDependencies().then(function (deps) {
+				return deps.structure();
+			}).then(function (structure) {
+				_feStructure = structure;
+				if (callback) callback(_feStructure);
+			}).catch(function (error) {
+				Debug.log("Tracker discovery failed: " + error.message, Debug.HIGH_PRIORITY);
+				// Keep last successful display, but report failure to scan callers.
+				if (callback) callback(null);
+			});
+			return;
+		}
 
 		var doFetch = function () {
 			_setConfigGuiLid();
