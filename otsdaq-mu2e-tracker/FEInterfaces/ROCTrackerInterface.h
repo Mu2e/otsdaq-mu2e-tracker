@@ -97,6 +97,7 @@ public:
 	void ReadSPI(__ARGS__);
 	void PrintStatus(__ARGS__);
   void MeasureChannelRates(__ARGS__);
+  void PublishRateSummary(__ARGS__);
 
 	void FindAndSerializeThresholds(__ARGS__);
 	void DeserializeAndSetThresholds(__ARGS__);
