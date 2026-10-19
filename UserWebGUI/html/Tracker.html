@@ -13,11 +13,11 @@
 	<script type="text/JavaScript" src="/WebPath/js/Debug.js"></script>
 	<script type="text/JavaScript" src="/WebPath/js/DesktopContent.js"></script>
 	<script type="text/JavaScript" src="/WebPath/js/js_lib/ConfigurationAPI.js"></script>
-	<script type="text/JavaScript" src="../js/TrackerRateMask.js?v=report-categories-20261004"></script>
+	<script type="text/JavaScript" src="../js/TrackerRateMask.js?v=applied-groups-20261019-1"></script>
 	<script type="text/JavaScript" src="../js/TrackerRatesRun.js?v=iterator-20261009-1"></script>
 	<script type="text/JavaScript" src="/WebPath/UserWebPath/js/Mu2e.js"></script>
-	<script type="text/JavaScript" src="../js/TrackerHardware.js?v=20261016-partial-roc-1"></script>
-	<script type="text/JavaScript" src="../js/TrackerTestFlight.js?v=20261015-1"></script>
+	<script type="text/JavaScript" src="../js/TrackerHardware.js?v=20261019-link-summary-1"></script>
+	<script type="text/JavaScript" src="../js/TrackerTestFlight.js?v=20261019-dtc-list-1"></script>
 	<style>
 		.tracker-counters-scroll { overflow-x: auto; margin: 6px 0 16px; }
 		.tracker-counters-table { border-collapse: collapse; font-size: 12px; white-space: nowrap; }
@@ -36,7 +36,7 @@
 	<script>
 		var _structureReady = false;
 		var _macrosReady = false;
-		var _expandedDTCs = {};
+		var _expandedDTC = null;
 		var _selectedUID = null;
 		var _activeMacros = null;
 		var _macroRunTarget = null;
@@ -73,18 +73,21 @@
 			renderGlobalActions();
             refreshTrackerRatesRunStatus();
 
-			Mu2eHardware.fetchActiveConfig(function (cfg) {
-				var el = document.getElementById("activeConfigInfo");
-				if (!el || !cfg || !cfg.config) return;
-				var text = cfg.config.groupName + " (" + cfg.config.groupKey + ")";
-				if (cfg.configAlias) text = cfg.configAlias + " — " + text;
-				el.textContent = text;
-			});
-
-			Mu2eHardware.fetchStructure(function () {
-				_structureReady = true;
-				if (_macrosReady) renderDTCGrid();
-			});
+            Mu2eHardware.fetchStructure(function (structure) {
+                _structureReady = true;
+                if (structure && structure.groups && structure.groups.configuration) {
+                    var active = structure.groups.configuration;
+                    var el = document.getElementById("activeConfigInfo");
+                    el.textContent = "Configured: " + (active.alias ? active.alias + " — " : "") + active.name + " (" + active.key + ")";
+                    var selected = structure.groups.selected;
+                    if (selected && (!TrackerRateMask.sameGroup(active, selected) || !TrackerRateMask.sameGroup(active.context, selected.context))) {
+                        var pending = document.createElement("div");
+                        pending.textContent = "Selected on disk: " + selected.name + " (" + selected.key + "); not applied by Configure.";
+                        el.appendChild(pending);
+                    }
+                }
+                if (_macrosReady) renderDTCGrid();
+            });
 
 			Mu2eHardware.fetchMacroList(function () {
 				_macrosReady = true;
@@ -312,7 +315,7 @@
 
 			for (var i = 0; i < dtcs.length; ++i) {
 				var dtc = dtcs[i];
-				var open = !!_expandedDTCs[dtc.name];
+				var open = _expandedDTC === dtc.name;
 				var selected = _selectedUID === dtc.name;
 				var commandState = _dtcCommandState[dtc.name];
 				var dotClass = dtc.enabled ? "status-on" : "status-off";
@@ -365,7 +368,7 @@
 		function toggleDTC(uid, event) {
 			if (_globalBusy) return;
 			if (event) event.stopPropagation();
-			_expandedDTCs[uid] = !_expandedDTCs[uid];
+			_expandedDTC = _expandedDTC === uid ? null : uid;
 			_selectedUID = uid;
 			renderDTCGrid();
 			renderSelection(uid);
@@ -376,7 +379,7 @@
 			if (event) event.stopPropagation();
 			_selectedUID = uid;
 			var parent = Mu2eHardware.getParentDTC(uid);
-			if (parent) _expandedDTCs[parent] = true;
+			if (parent) _expandedDTC = parent;
 			renderDTCGrid();
 			renderSelection(uid);
 		}
@@ -507,9 +510,7 @@
 				return "Adjust CAL/HV threshold DACs on " + _selectedUID +
 					" and save per-panel JSON files? Existing files get .bak copies. Data taking must be stopped.";
 			if (macroName === "ROC FEMacro - Deserialize and set thresholds")
-				return "Program configured thresholds on " + _selectedUID +
-					"?\n\nThis writes all configured Cal and HV threshold DACs. " +
-					"Run only when tracker data taking is stopped.";
+				return "";
 			if (/reset|\bwrite\b/i.test(macroName))
 				return "Run " + Mu2eHardware.macroDisplayName(macroName) +
 					" on " + _selectedUID + "?";
@@ -586,9 +587,7 @@
 			},
 			"set-thresholds": {
 				label: "Set Thresholds", macro: "ROC FEMacro - Deserialize and set thresholds",
-				allROCs: true, validateOnly: false,
-				confirm: "Program configured thresholds on every enabled tracker ROC?\n\n" +
-					"This writes all Cal and HV DACs and is not atomic. Run only when data taking is stopped."
+				allROCs: true, validateOnly: false
 			}
 		};
 
@@ -778,9 +777,9 @@
 				"<div class='macro-input-row'><label for='trackerRateThreshold'>Rate threshold (kHz):</label>" +
 				"<input id='trackerRateThreshold' type='number' min='0' step='any' value='" + escapeHTML(_rateMaskThreshold) + "'></div>" +
 				"<div class='macro-input-row'><label for='trackerRateAction'>Action:</label>" +
-				"<select id='trackerRateAction'><option value='mask'>Mask and activate</option><option value='report'>Report only</option></select></div>" +
+				"<select id='trackerRateAction'><option value='mask'>Mask and activate</option><option value='rebalance'>Mask above + enable below, activate</option><option value='report'>Report only</option></select></div>" +
 				"<p>Report only lists enabled straws above the threshold and disabled straws below it, using the current channel table. Straws exactly at the threshold are excluded. Reporting does not change the configuration or re-enable channels.</p>" +
-				"<p>Measure DTCs in parallel, checking every enabled tracker ROC. For Mask and activate, after all measurements finish, record channels above the threshold, download the current channel-table CSV, change their Enabled cells to No, upload the CSV and activate the new configuration.</p>" +
+				"<p>Measure DTCs in parallel, checking every enabled tracker ROC. For Mask and activate, after all measurements finish, record channels above the threshold, download the current channel-table CSV, change their Enabled cells to No, upload the CSV and activate the new configuration. The Mask above + enable below option also changes measured disabled straws strictly below the threshold to Yes. Unmeasured channels and excluded ROCs remain unchanged.</p>" +
 				"<p>Run while DAQ is stopped and Configured. Rate measurement changes readout settings; initialize readout before the next run.</p>" +
 				"<div id='trackerRateMaskError' class='badValue'></div>" +
 				"<button class='macro-run-btn' type='button' onclick='runTrackerRateMask()'>Run</button> " +
@@ -810,7 +809,8 @@
 			document.getElementById("trackerRateMaskError").textContent = "";
 			var entry = createOutputEntry();
 			var reportOnly = document.getElementById("trackerRateAction").value === "report";
-			var report = {area: "Tracker", report_only: reportOnly, changes: [], rates: []};
+			var reenableBelow = _rateMaskAction === "rebalance";
+			var report = {area: "Tracker", report_only: reportOnly, reenable_below_threshold: reenableBelow, changes: [], rates: []};
 			_rateMaskReports[entry] = report;
 			setGlobalDisabled(true);
 			function show(message, error) {
@@ -841,11 +841,13 @@
 				    });
 				}
 				if (report.activated) html += "<p>Use this new group key for the next Configure. Existing aliases still select their prior keys.</p>";
-				if (report.changes.length) {
-					html += "<details><summary>Newly disabled channels (" + report.changes.length + ")</summary><table class='settings-table'><tr><th>ROC / Panel</th><th>Channel</th><th>Total (kHz)</th></tr>";
-					report.changes.forEach(function (r) { html += "<tr><td>" + escapeHTML(r.uid + " / " + r.panel) + "</td><td>" + r.channel + "</td><td>" + r.total_khz + "</td></tr>"; });
-					html += "</table></details>";
-				}
+                [{label: "Newly disabled channels", rows: report.newly_disabled || []},
+                 {label: "Newly enabled channels", rows: report.newly_enabled || []}].forEach(function (list) {
+                    if (!list.rows.length) return;
+                    html += "<details><summary>" + list.label + " (" + list.rows.length + ")</summary><table class='settings-table'><tr><th>ROC / Panel</th><th>Channel</th><th>Total (kHz)</th></tr>";
+                    list.rows.forEach(function (r) { html += "<tr><td>" + escapeHTML(r.uid + " / " + r.panel) + "</td><td>" + r.channel + "</td><td>" + r.total_khz + "</td></tr>"; });
+                    html += "</table></details>";
+                });
 				html += "<button type='button' onclick=\"downloadTrackerRateMaskReport('" + entry + "')\">" + (reportOnly ? "Download rate report" : "Download scan and rollback report") + "</button></div>";
 				if (report.originalCSV) html += "<button type='button' onclick=\"downloadTrackerRateMaskCSV('" + entry + "',false)\">Download original CSV</button> ";
 				if (report.editedCSV) html += "<button type='button' onclick=\"downloadTrackerRateMaskCSV('" + entry + "',true)\">Download edited CSV</button>";
@@ -853,10 +855,12 @@
 			}
 			try {
 				if (reportOnly && TrackerRateMask.supportsReportOnly !== true) throw new Error("Reload Tracker to load the report-only implementation before running.");
+				if (reenableBelow && TrackerRateMask.supportsReenableBelow !== true) throw new Error("Reload Tracker to load the re-enable option before running.");
 				var deps = await TrackerRateMask.browserDependencies();
-				await TrackerRateMask.run(deps, threshold, report, function (message) { show(message, false); }, {reportOnly: reportOnly});
-				show(reportOnly ? "Rate report complete; configuration unchanged." : report.no_changes ? "No new masks needed; configuration unchanged." : "Channel-table CSV uploaded, verified, and configuration activated.", false);
-				if (report.activated) document.getElementById("activeConfigInfo").textContent = report.savedGroup.name + " (" + report.savedGroup.key + ")";
+				await TrackerRateMask.run(deps, threshold, report, function (message) { show(message, false); }, {reportOnly: reportOnly, reenableBelow: reenableBelow});
+				show(reportOnly ? "Rate report complete; configuration unchanged." : report.no_changes ? "No channel changes needed; configuration unchanged." : "Channel-table CSV uploaded, verified, and configuration activated.", false);
+				if (report.activated) document.getElementById("activeConfigInfo").textContent =
+                    "Configured: " + report.originalGroup.name + " (" + report.originalGroup.key + "). Selected on disk: " + report.savedGroup.name + " (" + report.savedGroup.key + "); not applied by Configure.";
 			} catch (e) {
 				report.error = e.message;
 				show("Stopped: " + e.message + (report.save_started ? " Inspect the saved versions and active group before retrying." : " No configuration was saved or activated."), true);
