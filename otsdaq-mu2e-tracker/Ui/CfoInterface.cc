@@ -41,7 +41,7 @@ namespace trkdaq {
     //    int link_mask = 0;
     for (int i=0; i<8; i++) {
       int ndtcs = (fLinkMask >> 4*i) & 0xf;
-      if (ndtcs > 0) fCfo->EnableLink (CFO_Link_ID(i),DTC_LinkEnableMode(true ,true ),ndtcs);
+      if (ndtcs > 0) fCfo->EnableLink (CFO_Link_ID(i),DTC_LinkEnableMode(true ,true ));
       else           fCfo->DisableLink(CFO_Link_ID(i),DTC_LinkEnableMode(false,false));
     }
   }
