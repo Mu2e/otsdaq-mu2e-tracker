@@ -259,6 +259,22 @@
         const current = one(xml, 'current_state'), transition = one(xml, 'in_transition');
         requireOK(allowed.includes(current) && transition === '0', name + ' is ' + current + ' (transition=' + transition + '). Expected ' + allowed.join(' or ') + ', with no transition in progress.');
     };
+    api.activatedGroups = async function (scope) {
+        // getActiveTableGroups describes the user's Configuration GUI editor.
+        // Ask the gateway for persisted activation records instead, then still
+        // verify the loaded configuration before permitting a hardware test.
+        const xml = await api.request(scope, scope.config, 'getLastTableGroups');
+        const group = type => {
+            const name = one(xml, 'LastActivated' + type + 'GroupName');
+            const key = one(xml, 'LastActivated' + type + 'GroupKey');
+            requireOK(/^\d+$/.test(key) && Number.isSafeInteger(Number(key)) && Number(key) <= 0xfffffffe,
+                'Invalid ' + scope.name + ' last activated ' + type + ' group key.');
+            return {name, key};
+        };
+        try {
+            return Object.assign(group('Config'), {context: group('Context')});
+        } catch (e) { throw new Error(scope.name + ' saved active groups: ' + e.message); }
+    };
     api.browserDependencies = async function () {
         const trackerDeps = await TrackerRateMask.browserDependencies();
         const dc = DesktopContent;
@@ -268,11 +284,7 @@
         const cfo = api.cfoRoute(await api.request(top, top.lid, 'getDesktopIcons')); cfo.name = 'CFO';
         cfo.mm = await app(cfo, 'ots::MacroMakerSupervisor'); cfo.config = await app(cfo, 'ots::ConfigurationGUISupervisor');
         const trackerMM = await app(tracker, 'ots::MacroMakerSupervisor');
-        const activeCFO = async () => {
-            const xml = await api.request(cfo, cfo.config, 'getActiveTableGroups');
-            return {name: one(xml, 'Configuration-ActiveGroupName'), key: one(xml, 'Configuration-ActiveGroupKey'),
-                context: {name: one(xml, 'Context-ActiveGroupName'), key: one(xml, 'Context-ActiveGroupKey')}};
-        };
+        const activeCFO = () => api.activatedGroups(cfo);
         const state = async scope => {
             const xml = await api.request(scope, scope.lid, 'getCurrentState');
             api.assertState(xml, scope.name, scope === top ? ['Configured', 'Halted', 'Initial'] : ['Configured']);

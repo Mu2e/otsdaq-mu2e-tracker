@@ -1975,6 +1975,34 @@ var Mu2eHardware = Mu2eHardware || {};
 		return html + "</div>";
 	};
 
+	// Successful-ROC outputs omit failed links. Check the complete backend
+	// summary before treating zero return codes as success. Older responses
+	// without this optional output retain their existing result checks.
+	Mu2eHardware.rocLinkSummariesSucceeded = function (result) {
+		if (!result || result.error) return false;
+		var targets = result.targets || [];
+		for (var t = 0; t < targets.length; ++t) {
+			var outputs = targets[t].outputs || {};
+			var names = Object.keys(outputs);
+			for (var n = 0; n < names.length; ++n) {
+				if (_decodeURIComponentSafe(names[n]).trim().toLowerCase() !== "link summary") continue;
+				var text = String(outputs[names[n]]);
+				var count = text.match(/^\s*(\d+) of (\d+) ROC\(s\) OK\./);
+				if (!count || Number(count[1]) !== Number(count[2]) ||
+					Number(count[2]) < 1 || Number(count[2]) > 6) return false;
+				var pattern = /(?:^|\n)\s*Link ([0-5]):\s*(OK|FAILED)\b/g;
+				var seen = {}, match, links = 0;
+				while ((match = pattern.exec(text)) !== null) {
+					if (seen[match[1]] || match[2] !== "OK") return false;
+					seen[match[1]] = true;
+					++links;
+				}
+				if (links !== Number(count[2])) return false;
+			}
+		}
+		return true;
+	};
+
 	Mu2eHardware.formatMacroResult = function (macroName, result, deviceUID) {
 		if (result.error) {
 			return "<div class='macro-result-error'><b>Macro failed</b><div>" +
@@ -1982,6 +2010,9 @@ var Mu2eHardware = Mu2eHardware || {};
 		}
 
 		var str = "<div class='macro-result'>";
+		if (!Mu2eHardware.rocLinkSummariesSucceeded(result))
+			str += "<div class='macro-result-error'><b>ROC operation failed</b>" +
+				"<div>One or more ROC links failed or returned an incomplete summary. See Link Summary below.</div></div>";
 		var now = new Date();
 		str += "<div class='macro-result-summary'><strong>" + _esc(
 			Mu2eHardware.macroDisplayName(macroName)) + "</strong>";

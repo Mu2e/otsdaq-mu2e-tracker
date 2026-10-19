@@ -16,8 +16,8 @@
 	<script type="text/JavaScript" src="../js/TrackerRateMask.js?v=report-categories-20261004"></script>
 	<script type="text/JavaScript" src="../js/TrackerRatesRun.js?v=iterator-20261009-1"></script>
 	<script type="text/JavaScript" src="/WebPath/UserWebPath/js/Mu2e.js"></script>
-	<script type="text/JavaScript" src="../js/TrackerHardware.js"></script>
-	<script type="text/JavaScript" src="../js/TrackerTestFlight.js?v=20261006-7"></script>
+	<script type="text/JavaScript" src="../js/TrackerHardware.js?v=20261016-partial-roc-1"></script>
+	<script type="text/JavaScript" src="../js/TrackerTestFlight.js?v=20261015-1"></script>
 	<style>
 		.tracker-counters-scroll { overflow-x: auto; margin: 6px 0 16px; }
 		.tracker-counters-table { border-collapse: collapse; font-size: 12px; white-space: nowrap; }
@@ -238,7 +238,7 @@
 		}
 
 		function commandSucceeded(macroName, result, counterLinks) {
-			if (!result || result.error) return false;
+			if (!result || result.error || !Mu2eHardware.rocLinkSummariesSucceeded(result)) return false;
 			if (macroName === "ROC FEMacro - Find and serialize thresholds")
 				return Mu2eHardware.thresholdScanSucceeded(result);
 			if (macroName === "ROC FEMacro - Get DTC Counter Values")
