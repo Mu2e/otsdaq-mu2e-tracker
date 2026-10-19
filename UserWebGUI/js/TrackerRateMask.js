@@ -19,6 +19,25 @@
         requireOK(s !== "", "Missing response field: " + name);
         return s;
     }
+    api.configuredGroup = function (history, status) {
+        const identity = field => {
+            const entries = values(history, field);
+            requireOK(entries.length === 1 && entries[0], "Missing/ambiguous " + field);
+            return entries[0];
+        };
+        const name = identity("LastConfiguredGroupName"), key = identity("LastConfiguredGroupKey");
+        requireOK(/^\d+$/.test(key) && Number.isSafeInteger(Number(key)) && Number(key) <= 0xfffffffe,
+            "Invalid last configured tracker group key.");
+        const details = values(status, "detail").filter(d => d.includes("translates to " + name + "(" + key + ")."));
+        const contexts = details.map(d => /Active Context Group ([A-Za-z0-9_.-]+)\((\d+)\)\./.exec(d));
+        requireOK(contexts.length && contexts.every(Boolean), "Cannot verify the configured tracker group and running Context from Gateway status.");
+        const context = {name: contexts[0][1], key: contexts[0][2]};
+        requireOK(contexts.every(c => c[1] === context.name && c[2] === context.key) &&
+            Number.isSafeInteger(Number(context.key)) && Number(context.key) <= 0xfffffffe,
+            "Ambiguous configured tracker Context.");
+        const aliases = values(history, "LastConfiguredAliasGroupName");
+        return {name, key, context, alias: aliases.length === 1 ? aliases[0] : ""};
+    };
     api.threshold = function (s) {
         requireOK(String(s).trim() !== "" && Number.isFinite(Number(s)) && Number(s) >= 0,
             "Enter a finite, nonnegative rate threshold in kHz.");
@@ -185,9 +204,10 @@
         requireOK(tables.length === links.length && tables.every(t => t.length === 96), "Incomplete rate tables.");
         return links.flatMap((link, i) => tables[i].map(r => Object.assign({dtc: target.uid, roc: link}, r)));
     };
-    api.plan = function (table, targets, rates, threshold) {
+    api.plan = function (table, targets, rates, threshold, options) {
+        const reenableBelow = options && options.reenableBelow === true;
         const rows = table.rows.map(r => Object.assign({}, r)), changes = [], aboveThreshold = [],
-            enabledAboveThreshold = [], disabledBelowThreshold = [], seen = new Set();
+            enabledAboveThreshold = [], disabledBelowThreshold = [], newlyEnabled = [], seen = new Set();
         const rocs = new Map(targets.flatMap(t => t.rocs.map(r => [t.uid + ":" + r.link, r])));
         rates.forEach(rate => {
             const key = rate.dtc + ":" + rate.roc + ":" + rate.channel;
@@ -206,10 +226,17 @@
                     rows[rowIndex].Enabled = "No";
                     changes.push(straw);
                 }
-            } else if (rate.total_khz < threshold && straw.enabled === "No") disabledBelowThreshold.push(straw);
+            } else if (rate.total_khz < threshold && straw.enabled === "No") {
+                disabledBelowThreshold.push(straw);
+                if (reenableBelow) {
+                    rows[rowIndex].Enabled = "Yes";
+                    newlyEnabled.push(straw);
+                    changes.push(straw);
+                }
+            }
         });
         requireOK(seen.size === rocs.size * 96, "Incomplete rate coverage; no configuration saved.");
-        return {rows, changes, aboveThreshold, enabledAboveThreshold, disabledBelowThreshold};
+        return {rows, changes, aboveThreshold, enabledAboveThreshold, disabledBelowThreshold, newlyEnabled};
     };
     api.serialize = function (table, rows) {
         const hs = table.headers.filter(h => !AUDIT.has(h));
@@ -261,15 +288,18 @@
     }
     // Dependency injection lets offline tests exercise every failure boundary.
     api.supportsReportOnly = true;
+    api.supportsReenableBelow = true;
     api.run = async function (deps, threshold, report, progress, options) {
         options = options || {};
         requireOK(options.reportOnly === undefined || typeof options.reportOnly === "boolean", "Invalid report-only option.");
+        requireOK(options.reenableBelow === undefined || typeof options.reenableBelow === "boolean", "Invalid re-enable option.");
         const reportOnly = options.reportOnly === true;
+        report.reenable_below_threshold = options.reenableBelow === true;
         report.report_only = reportOnly;
         threshold = api.threshold(threshold);
         report.threshold_khz = threshold; report.started_at = new Date().toISOString();
         progress("Checking stopped DAQ and active configuration...");
-        const baseline = await deps.active(); report.originalGroup = baseline;
+        const baseline = await (deps.baseline ? deps.baseline() : deps.active()); report.originalGroup = baseline;
         await deps.guard(baseline);
         report.targets = api.scanTargets(await deps.targets());
         report.excluded_rocs = report.targets.excluded || [];
@@ -324,26 +354,28 @@
             tables[name] = await deps.table(name, group.members[name]);
         }
         api.mapping(report.targets, tables);
-        const plan = api.plan(tables[CHANNELS], report.targets, report.rates, threshold);
+        const plan = api.plan(tables[CHANNELS], report.targets, report.rates, threshold, {reenableBelow: !reportOnly && report.reenable_below_threshold});
         report.above_threshold = plan.aboveThreshold;
         report.enabled_above_threshold = plan.enabledAboveThreshold;
         report.disabled_below_threshold = plan.disabledBelowThreshold;
         if (reportOnly) {
             report.changes = [];
+            report.newly_disabled = []; report.newly_enabled = [];
             report.finished_at = new Date().toISOString();
             progress("Report complete: " + report.enabled_above_threshold.length + " enabled straws above " + threshold +
                 " kHz; " + report.disabled_below_threshold.length + " disabled straws below it. Configuration unchanged.");
             return report;
         }
         report.changes = plan.changes;
+        report.newly_disabled = plan.enabledAboveThreshold; report.newly_enabled = plan.newlyEnabled;
         report.editedCSV = api.toCSV(tables[CHANNELS], plan.rows);
         api.verifyTable({headers: tables[CHANNELS].headers, rows: plan.rows}, {headers: tables[CHANNELS].headers, rows: api.fromCSV(report.editedCSV, tables[CHANNELS])});
-        progress("Scan complete: " + report.rates.length + " channels; " + plan.changes.length + " new masks.");
+        progress("Scan complete: " + report.rates.length + " channels; " + report.newly_disabled.length + " newly disabled; " + report.newly_enabled.length + " newly enabled.");
         if (!plan.changes.length) { report.no_changes = true; report.finished_at = new Date().toISOString(); return report; }
         // Re-read baseline before write: preserve its complete data, not a cached/latest version.
         api.verifyTable(tables[CHANNELS], await deps.table(CHANNELS, group.members[CHANNELS]));
         await deps.guard(baseline);
-        progress("Uploading channel-table CSV with " + plan.changes.length + " Enabled cells changed to No...");
+        progress("Uploading channel-table CSV with " + report.newly_disabled.length + " Enabled cells changed to No and " + report.newly_enabled.length + " changed to Yes...");
         report.save_started = true;
         const version = await deps.uploadCSV(tables[CHANNELS], report.editedCSV, report);
         requireOK(persistent(version) && String(version) !== group.members[CHANNELS], "Expected a new persistent channel-table version.");
@@ -411,10 +443,35 @@
         configLid = required(await request("getAppId", {classNeedle: "ots::ConfigurationGUISupervisor"}, "", true), "id");
         requireOK(/^\d+$/.test(configLid) && Number(configLid) > 0, "Configuration GUI unavailable.");
         const deps = {};
-        deps.active = async () => {
-            const xml = await request("getActiveTableGroups");
-            return {name: required(xml, "Configuration-ActiveGroupName"), key: required(xml, "Configuration-ActiveGroupKey"),
-                context: {name: required(xml, "Context-ActiveGroupName"), key: required(xml, "Context-ActiveGroupKey")}};
+        let activeRead;
+        deps.active = () => {
+            // getActiveTableGroups is the editor's view, which activation failure
+            // can clear and ordinary editing can leave stale. Reload persistent
+            // groups through the standard System View API; temporary versions
+            // are preserved. Coalesce concurrent DTC guards into one refresh.
+            if (!activeRead) activeRead = request("getGroupAliases", {reloadActiveGroups: 1}).then(xml => {
+                const group = type => {
+                    const name = values(xml, type + "-ActiveGroupName"), key = values(xml, type + "-ActiveGroupKey");
+                    requireOK(name.length === 1 && name[0] && key.length === 1 &&
+                        /^\d+$/.test(key[0]) && Number.isSafeInteger(Number(key[0])) && Number(key[0]) <= 0xfffffffe,
+                        "Missing/invalid persisted " + type + " group after refreshing the Configuration GUI.");
+                    return {name: name[0], key: key[0]};
+                };
+                return Object.assign(group("Configuration"), {context: group("Context")});
+            }).finally(() => { activeRead = null; });
+            return activeRead;
+        };
+        let configuredRead;
+        deps.configured = () => {
+            if (!configuredRead) configuredRead = Promise.all([
+                request("getLastTableGroups"), request("getAppStatus", {}, "", true)
+            ]).then(([history, status]) => api.configuredGroup(history, status))
+                .finally(() => { configuredRead = null; });
+            return configuredRead;
+        };
+        deps.baseline = async () => {
+            const [configured, selected] = await Promise.all([deps.configured(), deps.active()]);
+            return Object.assign({}, configured, {selected});
         };
         deps.guard = async group => {
             const state = await request("getCurrentState", {}, "", true);
@@ -423,12 +480,14 @@
                 "Tracker at " + (DesktopContent._localOrigin || "this page's origin") +
                 " must be Configured and stopped, with no transition in progress. Received state=" +
                 (currentState || "missing") + ", in_transition=" + (transition === undefined ? "missing" : transition) + ".");
-            const active = await deps.active();
-            requireOK(api.sameGroup(group, active), "Active Configuration group changed; operation stopped.");
-            requireOK(!group.context || api.sameGroup(group.context, active.context), "Active Context group changed; operation stopped.");
-            const status = await request("getAppStatus", {}, "", true);
-            requireOK(values(status, "detail").some(d => d.includes("translates to " + group.name + "(" + group.key + ").")),
-                "Loaded front-end configuration does not match the active group. Configure the selected baseline first.");
+            const current = await deps.configured();
+            requireOK(api.sameGroup(group, current), "Configured tracker group changed; operation stopped.");
+            requireOK(!group.context || api.sameGroup(group.context, current.context), "Configured tracker Context changed; operation stopped.");
+            if (group.selected) {
+                const selected = await deps.active();
+                requireOK(api.sameGroup(group.selected, selected) && api.sameGroup(group.selected.context, selected.context),
+                    "Saved selection changed during the operation; stopped to preserve the new selection.");
+            }
         };
         async function groupMetadata(g) {
             return api.group(await request("getSpecificTableGroup", {groupName: g.name, groupKey: g.key}), g.name, g.key);
@@ -444,17 +503,19 @@
             return {table, csv: api.toCSV(table)};
         };
         deps.structure = async () => {
-            const active = await deps.active(), configuration = await deps.group(active), context = await deps.group(active.context);
+            const active = await deps.baseline(), configuration = await deps.group(active), context = await deps.group(active.context);
             const tables = {};
             for (const name of ["XDAQContextTable", "XDAQApplicationTable", "FESupervisorTable", "FEInterfaceTable", "DTCInterfaceTable", ROCS]) {
                 const members = ["XDAQContextTable", "XDAQApplicationTable"].includes(name) ? context.members : configuration.members;
                 requireOK(persistent(members[name]), "Missing topology table: " + name);
                 tables[name] = await deps.table(name, members[name]);
             }
-            const after = await deps.active();
-            requireOK(api.sameGroup(active, after) && api.sameGroup(active.context, after.context), "Active topology changed during discovery; operation stopped.");
+            const after = await deps.baseline();
+            requireOK(api.sameGroup(active, after) && api.sameGroup(active.context, after.context) &&
+                api.sameGroup(active.selected, after.selected) && api.sameGroup(active.selected.context, after.selected.context),
+                "Configured topology or saved selection changed during discovery; operation stopped.");
             const structure = api.structure(tables);
-            structure.groups = {configuration: active, context: active.context};
+            structure.groups = {configuration: active, context: active.context, selected: active.selected};
             return structure;
         };
         deps.targets = async () => {
@@ -487,7 +548,8 @@
             Mu2eHardware.runMacro(target.uid, MACRO, {[m.inputs[0]]: "0x" + mask.toString(16)}, resolve);
             // No command retry/timeout: an in-flight hardware macro must finish restoration.
         });
-        function comment(report) { return "Tracker Total > " + report.threshold_khz + " kHz; " + report.started_at + "; " + report.changes.length + " new masks"; }
+        function comment(report) { return "Tracker rate threshold " + report.threshold_khz + " kHz; " + report.started_at +
+            "; " + (report.newly_disabled || report.changes).length + " newly disabled; " + (report.newly_enabled || []).length + " newly enabled"; }
         deps.uploadCSV = async (table, csv, report) => {
             // ConfigurationGUI's CSV upload parses values then serializes cells
             // for saveSpecificTable; it has no raw multipart CSV upload endpoint.

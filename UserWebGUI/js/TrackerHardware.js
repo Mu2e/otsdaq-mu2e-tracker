@@ -2062,6 +2062,17 @@ var Mu2eHardware = Mu2eHardware || {};
 			}
 
 			if (specializedHTML) {
+				// Formatted tables contain successful ROC outputs only. Keep the
+				// backend summary visible so omitted links and their errors are explained.
+				for (var summaryIndex = 0; summaryIndex < outKeys.length; ++summaryIndex) {
+					var summaryName = outKeys[summaryIndex];
+					if (_decodeURIComponentSafe(summaryName).trim().toLowerCase() !== "link summary") continue;
+					var summaryHTML = _esc(t.outputs[summaryName]).replace(
+						/(^|\n)([^\n]*\bFAILED\b[^\n]*)/g,
+						"$1<span class='badValue'>$2</span>");
+					str += "<div class='macro-output-item'><div class='macro-output-name'>Link Summary</div>" +
+						"<div class='macro-output-value' style='white-space: pre-wrap;'>" + summaryHTML + "</div></div>";
+				}
 				str += specializedHTML;
 			} else if (outKeys.length) {
 				str += "<div class='macro-output-list'>";

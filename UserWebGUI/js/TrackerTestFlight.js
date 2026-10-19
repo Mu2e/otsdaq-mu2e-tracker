@@ -21,10 +21,33 @@
         return {duration: m[1] + m[2], markers: Number(markers), duration_ms: ms, run_ms: ms * (Number(markers) - 1)};
     };
     api.readerInputs = function (macro, command) {
-        requireOK(macro && macro.inputs && /^Command to 0\/Status/.test(macro.inputs[0]), 'Unsupported Buffer Test Detached macro.');
-        const defaults = ['0', 'true', '0', 'false', 'false', '', 'false', '0', 'false'];
-        requireOK(macro.inputs.length === defaults.length, 'Unexpected Buffer Test Detached inputs; reload Tracker.');
-        return Object.fromEntries(macro.inputs.map((name, i) => [name, i === 0 ? String(command) : defaults[i]]));
+        requireOK(macro && Array.isArray(macro.inputs), 'Unsupported Buffer Test Detached macro.');
+        requireOK([0, 1, 2].includes(command), 'Unsupported detached reader command.');
+        // FE releases add optional controls. Bind by meaning rather than position,
+        // preserving independent, non-EVB readers on both legacy and current FEs.
+        const defaults = new Map([
+            ['Command', String(command)],
+            ['Data are SubEvents', 'true'],
+            ['Starting Event Window Tag', '0'],
+            ['Match Event Tags', 'false'],
+            ['Save Binary Data to File', 'false'],
+            ['Save Binary Data Filename', ''],
+            ['Save Subevent Header to Binary File', 'false'],
+            ['Payload Packet Threshold for Saving Event', '0'],
+            ['EVB Mode', 'false'],
+            ['Merge Mode', '0'],
+            ['Check ROC Emulator Data', 'false'],
+            ['EVB Drain Only, no event assembly', 'false']
+        ]);
+        const required = Array.from(defaults.keys()).slice(0, 9), seen = new Set();
+        const inputs = macro.inputs.map(name => {
+            const key = /^Command to 0\/Status\b/.test(name) ? 'Command' : name.replace(/ \(Default.*$/, '');
+            requireOK(defaults.has(key) && !seen.has(key), 'Unsupported Buffer Test Detached input: ' + name);
+            seen.add(key);
+            return [name, defaults.get(key)];
+        });
+        requireOK(required.every(key => seen.has(key)), 'Buffer Test Detached is missing required inputs: ' + required.filter(key => !seen.has(key)).join(', '));
+        return Object.fromEntries(inputs);
     };
     api.cfoInputs = function (macro, options, enabled) {
         requireOK(macro && macro.inputs && macro.inputs.length === 11 && /^Enable CFO Run Plan Execution/.test(macro.inputs[0]) &&
@@ -80,11 +103,17 @@
     api.run = async function (deps, options, report, progress, control) {
         control = control || {}; progress = progress || (() => {});
         report.options = options; report.started_at = new Date().toISOString();
-        report.owned = []; report.reused = []; report.readers = {}; report.before = {}; report.after = {}; report.cleanup = [];
+        report.owned = []; report.reused = []; report.dtc_errors = {}; report.initial_readers = {}; report.readers = {}; report.before = {}; report.after = {}; report.cleanup = [];
         let session, launched = false, dirty = false;
         const checkStop = () => requireOK(!control.stop, 'TestFlight stopped by operator.');
         const batch = async (targets, task) => {
-            const settled = await Promise.allSettled(targets.map(task));
+            const settled = await Promise.allSettled(targets.map(async target => {
+                try { return await task(target); }
+                catch (error) {
+                    report.dtc_errors[target.uid] = String(error && error.message || error);
+                    throw error;
+                }
+            }));
             const failures = settled.map((r, i) => r.status === 'rejected' ? (r.reason.message.startsWith(targets[i].uid + ':') ? r.reason.message : targets[i].uid + ': ' + r.reason.message) : null).filter(Boolean);
             requireOK(!failures.length, failures.join('\n'));
             return settled.map(r => r.value);
@@ -96,7 +125,10 @@
             // Existing readers are reused without restarting or claiming ownership.
             const initial = await batch(session.targets, async t => {
                 const r = api.reader(await deps.buffer(t, 0), t.uid, t.links);
-                requireOK(!r.errors, t.uid + ': existing reader reports errors: ' + r.error_details.join('; ') + '. Halt it and inspect the report before retrying.');
+                // Halt keeps the previous reader's counters. Preserve that history;
+                // a stopped reader gets a fresh Start, which resets its counters.
+                report.initial_readers[t.uid] = r;
+                requireOK(!r.running || !r.errors, t.uid + ': running reader reports errors: ' + r.error_details.join('; ') + '. Halt it and inspect the report before retrying.');
                 return r;
             });
             initial.forEach((r, i) => { if (r.running) report.reused.push(session.targets[i].uid); });
@@ -105,7 +137,22 @@
                 checkStop();
                 if (!report.reused.includes(t.uid)) report.owned.push(t.uid); // include uncertain starts in cleanup
                 dirty = true;
-                const r = api.reader(await deps.buffer(t, 1), t.uid, t.links);
+                let r = api.reader(await deps.buffer(t, 1), t.uid, t.links);
+                report.readers[t.uid] = {start: r};
+                // Start can return before the detached thread finishes its buffer
+                // release and zeros the previous session's counters. No CFO plan
+                // has been launched yet. Confirm the fresh zero-count reader;
+                // never repeat Start or accept errors from an initialized reader.
+                if (report.owned.includes(t.uid)) {
+                    const deadline = deps.now() + 10000;
+                    while (r.running && r.count !== 0 && deps.now() < deadline) {
+                        checkStop(); await deps.guard(session);
+                        await deps.wait(250);
+                        r = api.reader(await deps.buffer(t, 0), t.uid, t.links);
+                        report.readers[t.uid].start = r;
+                    }
+                    requireOK(r.count === 0, t.uid + ': reader initialization did not reach fresh zero counters; ' + api.readerProblem(r));
+                }
                 requireOK(r.running && !r.errors, t.uid + ': detached reader did not start cleanly: ' + api.readerProblem(r));
             });
             await deps.guard(session); checkStop();
@@ -113,8 +160,8 @@
             await batch(session.targets, async t => {
                 report.before[t.uid] = api.counters(await deps.counters(t), t.uid);
                 const r = api.reader(await deps.buffer(t, 0), t.uid, t.links);
+                report.readers[t.uid].before = r;
                 requireOK(r.running && !r.errors, t.uid + ': reader is not ready: ' + api.readerProblem(r));
-                report.readers[t.uid] = {before: r};
             });
             await deps.guard(session); checkStop();
             progress('Launching CFO: ' + options.markers + ' markers at ' + options.duration + '…');
@@ -253,7 +300,13 @@
         // unique CFO route first; retain every CFO, login, or unknown error.
         try { api.cfoRoute(xml); } catch (e) { return ['CFO discovery: ' + e.message]; }
         const unrelatedFailure = /(?:\|GatewaySupervisor:\s*[^|\n]+\|\s*)?Connection failed for '[^']*' icon retrieval from Remote Gateway '([^']+)' at [^\n]*?\. Please check that the target is up and running at the correct IP address\.\s*/g;
-        return errors.map(error => error.replace(unrelatedFailure, (text, gateway) => /CFO/i.test(gateway) ? text : '')).filter(error => error.trim());
+        // Newer gateways return the underlying UDP timeout instead of the
+        // older "Connection failed" wrapper. Only strip that known icon error;
+        // preserve required-gateway failures and any unrecognized remainder.
+        const remoteIconTimeout = /(?:\|GatewaySupervisor:\s*[^|\n]+\|\s*)?Failure gathering Remote Gateway desktop icons with command 'GetRemoteDesktopIcons' from target '([^']+)' at url:\s*ots:[^\s|]+ due to error:\s*\|TransceiverSocket\.cc:\s*[^|\n]+\|\s*Timeout \([0-9]+(?:\.[0-9]+)? s\) or Error receiving response buffer from remote ip:port [^\s|]+:\d+ to this ip:port [^\s|]+:\d+\s*/g;
+        const keepRequired = (text, gateway) => /CFO|Tracker|(?:^|_)Trk(?:_|$)/i.test(gateway) ? text : '';
+        return errors.map(error => error.replace(unrelatedFailure, keepRequired)
+            .replace(remoteIconTimeout, keepRequired)).filter(error => error.trim());
     };
     api.assertState = function (xml, name, allowed) {
         const current = one(xml, 'current_state'), transition = one(xml, 'in_transition');
@@ -371,16 +424,41 @@
         if (report.cfo) html += '<p>CFO: ' + escape(report.cfo.uid) + ' at ' + escape(report.cfo.origin) + '</p>';
         if (report.cfo_stopped) html += '<p>CFO test stopped. Normal Start reloads the configured production run plan.</p>';
         if (report.reused && report.reused.length) html += '<p class="badValue">Previously running readers left running: ' + escape(report.reused.join(', ')) + '. Halt these before a normal run.</p>';
+        if (report.targets && report.targets.length) {
+            html += '<div class="tracker-counters-scroll"><table class="tracker-counters-table"><thead><tr><th>DTC</th><th>Result</th><th>Details</th></tr></thead><tbody>';
+            report.targets.forEach(target => {
+                const error = (report.dtc_errors || {})[target.uid];
+                const rows = (report.rows || []).filter(row => row.uid === target.uid);
+                let result, detail;
+                if (error) { result = 'FAIL'; detail = error; }
+                else if (rows.length) {
+                    result = rows.every(row => row.pass) ? 'PASS' : 'MISMATCH';
+                    detail = rows.length + ' enabled ROC counter results';
+                } else if (!report.launch_response) {
+                    result = report.finished_at ? 'NOT TESTED' : 'PENDING';
+                    detail = report.finished_at ? 'Stopped before CFO launch; no test counter results.' : 'Waiting for test data.';
+                } else { result = 'INCOMPLETE'; detail = 'Test launched; counter results unavailable.'; }
+                html += '<tr><th>' + escape(target.uid) + '</th><td' + (['FAIL', 'MISMATCH', 'INCOMPLETE'].includes(result) ? ' class="badValue"' : '') + '>' + result + '</td><td>' + escape(detail) + '</td></tr>';
+            });
+            html += '</tbody></table></div>';
+        }
         if (report.rows && report.rows.length) {
             html += '<p>Counter increases during this test. Expected: ' + report.options.markers + ' EWM/heartbeat packets and ' + (report.options.markers - 1) + ' data requests/headers per enabled ROC (one final null heartbeat).</p><div class="tracker-counters-scroll"><table class="tracker-counters-table"><thead><tr><th>DTC</th><th>ROC</th>' + labels.map(l => '<th>' + l + '</th>').join('') + '<th>Counter result</th></tr></thead><tbody>';
             report.rows.forEach(r => { html += '<tr><th>' + escape(r.uid) + '</th><td>' + r.link + '</td>' + r.counts.map((n, i) => '<td' + (n === r.expected[i] ? '' : ' class="counter-mismatch"') + '>' + n + '</td>').join('') + '<td>' + (r.pass ? 'PASS' : 'MISMATCH') + '</td></tr>'; });
             html += '</tbody></table></div>';
         }
+        if (report.initial_readers && Object.keys(report.initial_readers).length) {
+            const previousErrors = Object.entries(report.initial_readers).filter(([uid, r]) => !r.running && r.errors).map(([uid]) => uid);
+            if (previousErrors.length) html += '<p>Previous stopped-reader errors: ' + escape(previousErrors.join(', ')) + '. These belong to the previous reader session. A fresh Start resets the counters; errors from the new reader still fail this test.</p>';
+            html += '<details><summary>Reader status before this attempt (including previous session)</summary>';
+            Object.entries(report.initial_readers).forEach(([uid, r]) => { html += '<h4>' + escape(uid) + (r.running ? ' — running reader' : ' — stopped reader, previous session') + '</h4><pre>' + escape(r.text) + '</pre>'; });
+            html += '</details>';
+        }
         if (report.readers) {
-            const ignored = Object.entries(report.readers).flatMap(([uid, r]) => (r.after || r.before).ignored_timeouts || []).length;
+            const ignored = Object.entries(report.readers).flatMap(([uid, r]) => (r.after || r.before || r.start).ignored_timeouts || []).length;
             if (ignored) html += '<p>Timeout counts on disabled ROC links are excluded from reader checks. Enabled-link errors and reader exceptions still fail the test.</p>';
             html += '<details><summary>Reader status and raw outputs</summary>';
-            Object.keys(report.readers).forEach(uid => { const r = report.readers[uid]; html += '<h4>' + escape(uid) + '</h4><pre>' + escape(r.after ? r.after.text : r.before.text) + '</pre>'; });
+            Object.keys(report.readers).forEach(uid => { const r = report.readers[uid], latest = r.after || r.before || r.start; html += '<h4>' + escape(uid) + '</h4><pre>' + escape(latest.text) + '</pre>'; });
             html += '</details>';
         }
         if (report.cleanup && report.cleanup.length) html += '<details><summary>Cleanup</summary><pre>' + escape(report.cleanup.join('\n')) + '</pre></details>';
