@@ -167,7 +167,7 @@ namespace trkdaq {
     for (int lnk=0; lnk<8; lnk++) {
       int ndtcs = (fLinkMask >> 4*lnk) & 0xf;
       if (ndtcs > 0) {
-        fCfo->EnableLink (CFO_Link_ID(lnk),DTC_LinkEnableMode(true,true),ndtcs);
+        fCfo->EnableLink (CFO_Link_ID(lnk),DTC_LinkEnableMode(true,true));
         TLOG(TLVL_INFO) << std::format("enabled DTC time chain {} with {} DTCs\n",lnk,ndtcs);
       }
     }
