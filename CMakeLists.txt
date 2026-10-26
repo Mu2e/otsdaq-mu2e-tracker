@@ -39,13 +39,6 @@ find_package(ROOT              6.32.08 REQUIRED EXPORT)
 #   message(STATUS "${_variableName}=${${_variableName}}")
 # endforeach()
   
-# if (DEFINED ENV{MIDASSYS})
-#    message(-- P.Murat: otsdaq-mu2e-tracker: MIDASSYS=.$ENV{MIDASSYS}. )
-#    find_package(Midas REQUIRED)
-# else()
-#    message("-- P.Murat: no MIDASSYS")
-# endif()
-
 # XDAQ Extra setup
 include_directories($ENV{XDAQ_ROOT}/include)
 
@@ -69,6 +62,14 @@ link_directories($ENV{BTRK_LIB} $ENV{KINKAL_LIB})
 
 include(ArtDictionary)
 include(BuildPlugins)
+
+find_package(SWIG)
+if(DEFINED $ENV{BUILD_PYTHON_INTERFACE})
+if (${SWIG_FOUND})
+        set(BUILD_PYTHON_INTERFACE TRUE)
+	include(${SWIG_USE_FILE})
+endif()
+endif()
 
 # Code
 add_subdirectory(otsdaq-mu2e-tracker)

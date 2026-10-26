@@ -20,7 +20,7 @@ namespace trkdaq {
 
     CFOLib::CFO*         fCfo;
     int                  fPcieAddr;
-    uint                 fLinkMask;     // DTC link mask, 4 bits per N(DTCs)
+    uint                 fLinkMask;     // time chain mask
     int                  fEventMode;    // event mode = 0: null heartbeats
     int                  fJAMode;       // clock_source << 4 | reset
     int                  fEnabled;
@@ -51,6 +51,9 @@ namespace trkdaq {
 
     int          Halt();
     void         LaunchRunPlan();
+
+    int          LinkEnabled(int Lnk) { return (fLinkMask >> 4*Lnk) & 0xf ; }
+      
     void         SetRunPlan   (const std::string& Fn);
 
     int          PcieAddr     () { return fPcieAddr; }
