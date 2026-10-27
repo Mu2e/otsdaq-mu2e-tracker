@@ -21,10 +21,11 @@ namespace ots
 ///
 ///	Commands (StateMachine=iteratePluginCommand&plugin=TrackerNoiseRun&pluginCommand=...):
 ///		Start            -> take the Iterator; replies noise_run_accepted=1
-///		Stop             -> release after every submitted macro settles; replies noise_run_stop_requested=1
-///		StopAcknowledge  -> same, but also clears "unresolved" hardware operations (operator has checked the frontend)
-///		Halt             -> what iterateHalt becomes while this plugin owns the Iterator (same as Stop)
-///	Status fields appended to getIterationPlanStatus while owning: noise_run_*.
+///		Stop             -> release after every submitted macro settles; replies
+///noise_run_stop_requested=1 		StopAcknowledge  -> same, but also clears "unresolved"
+///hardware operations (operator has checked the frontend) 		Halt             -> what
+///iterateHalt becomes while this plugin owns the Iterator (same as Stop) 	Status fields
+///appended to getIterationPlanStatus while owning: noise_run_*.
 class TrackerNoiseRunPlugin : public IteratorPluginVInterface
 {
   public:
@@ -32,7 +33,9 @@ class TrackerNoiseRunPlugin : public IteratorPluginVInterface
 
 	const std::string& getPlanName(void) const override { return planName_; }
 
-	void handleCommand(const std::string& command, HttpXmlDocument& xml, IteratorPluginContext& context) override;
+	void handleCommand(const std::string&     command,
+	                   HttpXmlDocument&       xml,
+	                   IteratorPluginContext& context) override;
 	void initialize(IteratorPluginContext& context) override;
 	void step(IteratorPluginContext& context) override;
 	void finish(IteratorPluginContext& context) override;
@@ -43,7 +46,11 @@ class TrackerNoiseRunPlugin : public IteratorPluginVInterface
 
   private:
 	void                       guard(IteratorPluginContext& context);
-	tracker_noise_run::Outputs runMacro(IteratorPluginContext& context, const tracker_noise_run::Target& target, const std::string& name, const std::string& inputs, const std::vector<std::string>& outputs);
+	tracker_noise_run::Outputs runMacro(IteratorPluginContext&           context,
+	                                    const tracker_noise_run::Target& target,
+	                                    const std::string&               name,
+	                                    const std::string&               inputs,
+	                                    const std::vector<std::string>&  outputs);
 
 	const std::string planName_;
 
@@ -52,15 +59,18 @@ class TrackerNoiseRunPlugin : public IteratorPluginVInterface
 
 	// worker-thread state (set in initialize(), read in step())
 	std::vector<tracker_noise_run::Target> targets_;
-	std::vector<std::string>               identity_;  ///< persisted Context/Configuration name+key
+	std::vector<std::string> identity_;  ///< persisted Context/Configuration name+key
 
 	// shared between worker and status requests
 	mutable std::mutex statusMutex_;
-	uint64_t           scans_         = 0;
-	unsigned int       unresolvedOps_ = 0;  ///< hardware macros whose outcome is unknown; blocks ordinary Stop
-	std::string        lastSummary_, excludedRocs_;
+	uint64_t           scans_ = 0;
+	unsigned int       unresolvedOps_ =
+	    0;  ///< hardware macros whose outcome is unknown; blocks ordinary Stop
+	std::string lastSummary_, excludedRocs_;
 
-	static constexpr unsigned int pollTimeoutSeconds_ = 600;  ///< how long to keep polling an unreachable frontend before declaring the macro unresolved
+	static constexpr unsigned int pollTimeoutSeconds_ =
+	    600;  ///< how long to keep polling an unreachable frontend before declaring the
+	          ///< macro unresolved
 };
 
 }  // namespace ots

@@ -61,11 +61,12 @@ void TrackerNoiseRunPlugin::handleCommand(const std::string&     command,
 		        "NoiseRun is not the active Iterator plan. No other plan was stopped.");
 		std::lock_guard<std::mutex> lock(statusMutex_);
 		if(unresolvedOps_ && command == "Stop")
-			require(false,
-			        std::to_string(unresolvedOps_) +
-			            " NoiseRun hardware operation(s) have an unknown outcome (frontend "
-			            "did not answer). Check the frontend logs and ROC masks, then use "
-			            "pluginCommand=StopAcknowledge to release the Iterator.");
+			require(
+			    false,
+			    std::to_string(unresolvedOps_) +
+			        " NoiseRun hardware operation(s) have an unknown outcome (frontend "
+			        "did not answer). Check the frontend logs and ROC masks, then use "
+			        "pluginCommand=StopAcknowledge to release the Iterator.");
 		if(unresolvedOps_)
 			__COUT_WARN__ << "Operator acknowledged " << unresolvedOps_
 			              << " unresolved NoiseRun hardware operation(s); releasing the "
@@ -94,10 +95,11 @@ void TrackerNoiseRunPlugin::finish(IteratorPluginContext& /*context*/)
 }
 
 //==============================================================================
-void TrackerNoiseRunPlugin::addStatus(HttpXmlDocument& xml, IteratorPluginContext& context)
+void TrackerNoiseRunPlugin::addStatus(HttpXmlDocument&       xml,
+                                      IteratorPluginContext& context)
 {
 	std::lock_guard<std::mutex> lock(statusMutex_);
-	const std::string errorMessage =
+	const std::string           errorMessage =
 	    xml.getMatchingValue("error_message");  // already added by the Iterator
 	xml.addTextElementToData("noise_run_supported", "1");
 	xml.addTextElementToData("noise_run_fsm",
@@ -108,12 +110,12 @@ void TrackerNoiseRunPlugin::addStatus(HttpXmlDocument& xml, IteratorPluginContex
 	xml.addTextElementToData("noise_run_excluded_rocs", excludedRocs_);
 	xml.addNumberElementToData("noise_run_unresolved_ops", unresolvedOps_);
 	xml.addTextElementToData("noise_run_state",
-	                         !owned_ && !stopping_  ? "Inactive"
-	                         : unresolvedOps_       ? "Unresolved"
+	                         !owned_ && !stopping_   ? "Inactive"
+	                         : unresolvedOps_        ? "Unresolved"
 	                         : !errorMessage.empty() ? "Error"
-	                         : stopping_            ? "Stopping"
-	                         : scans_               ? "Running"
-	                                                : "Starting");
+	                         : stopping_             ? "Stopping"
+	                         : scans_                ? "Running"
+	                                                 : "Starting");
 }
 
 //==============================================================================
@@ -164,8 +166,8 @@ void TrackerNoiseRunPlugin::guard(IteratorPluginContext& context)
 void TrackerNoiseRunPlugin::initialize(IteratorPluginContext& context)
 {
 	ConfigurationManagerRW* configurationManager = context.configurationManager;
-	identity_ = tracker_noise_run::persistedIdentity(
-	    ConfigurationManager::ACTIVE_GROUPS_FILENAME);
+	identity_                                    = tracker_noise_run::persistedIdentity(
+        ConfigurationManager::ACTIVE_GROUPS_FILENAME);
 	std::string errors;
 	configurationManager->init(&errors);
 	require(errors.empty(), errors);
@@ -230,7 +232,8 @@ void TrackerNoiseRunPlugin::initialize(IteratorPluginContext& context)
 						target.links.push_back(
 						    roc.second.getNode("linkID").getValue<int>());
 					else if(feEnabled)
-						excluded.push_back(roc.first);  // disabled ROC under an enabled FE
+						excluded.push_back(
+						    roc.first);  // disabled ROC under an enabled FE
 					else
 						disabledFeRocs[fe.first].push_back(roc.first);
 				}
@@ -333,7 +336,8 @@ tracker_noise_run::Outputs TrackerNoiseRunPlugin::runMacro(
 	tx.addParameter("inputArgs", inputs);
 	std::string names;
 	for(const auto& outputName : outputs)
-		names += (names.empty() ? "" : ",") + StringMacros::encodeURIComponent(outputName);
+		names +=
+		    (names.empty() ? "" : ",") + StringMacros::encodeURIComponent(outputName);
 	tx.addParameter("outputArgs", names);
 	tx.addParameter("userPermissions", "allUsers:1");
 	tx.addParameter("AsyncSupported", "1");
@@ -465,7 +469,8 @@ void TrackerNoiseRunPlugin::step(IteratorPluginContext& context)
                 context,
                 target,
                 "ROC FEMacro - Publish Rate Summary",
-                input(target.publisherInputs.at(0), std::to_string(target.links.front())) +
+                input(target.publisherInputs.at(0),
+                      std::to_string(target.links.front())) +
                     ";" + input(target.publisherInputs.at(1), result.json(targets_)),
                 target.publisherOutputs);
             require(tracker_noise_run::scalar(out.at("Published")) == 1 &&
