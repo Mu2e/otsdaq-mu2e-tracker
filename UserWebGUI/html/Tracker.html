@@ -31,6 +31,9 @@
 		.tracker-counter-note { margin: 3px 0; }
 		.settings-table td.settings-value.rate-masked { background: #e0e0e0; color: #666; }
 		.settings-table td.settings-value.rate-high { background: #ffd6d6; color: #a40000; font-weight: bold; }
+		.tracker-roc-controls { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+		.tracker-led-button { font-size: 8px; padding: 3px 2px; }
+		.tracker-led-button:disabled { opacity: 0.5; cursor: default; }
 	</style>
 
 	<script>
@@ -49,6 +52,7 @@
 		var _globalCompletedTargets = {};
 		var _globalCounterLinks = {};
 		var _dtcCommandState = {};
+		var _rocLEDLastCommand = {}; // Successful commands from this page, not hardware readback.
 		var _outputEntrySequence = 0;
 		var ACTION_BUTTON_LIMIT = 8;
 		var _expandedActionGroups = {};
@@ -345,6 +349,10 @@
 					for (var r = 0; r < dtc.rocs.length; ++r) {
 						var roc = dtc.rocs[r];
 						var rocEnabled = dtc.enabled && roc.enabled === "1";
+						var turnLEDOff = _rocLEDLastCommand[roc.name] !== "off";
+						var ledAction = turnLEDOff ? "off" : "on";
+						var ledTarget = rocLEDTarget(roc.name, turnLEDOff);
+						html += "<div class='tracker-roc-controls'>";
 						html += "<button type='button' class='tracker-roc-button" +
 							(rocEnabled ? "" : " tracker-device-disabled") +
 							(_selectedUID === roc.name ? " tracker-device-selected" : "") +
@@ -353,6 +361,12 @@
 						html += "<span class='status-dot " +
 							(rocEnabled ? "status-on" : "status-off") + "'></span>";
 						html += "<span>ROC " + r + "</span></button>";
+						html += "<button type='button' class='tracker-roc-button tracker-led-button' " +
+							"aria-label='Turn KEY LED " + ledAction + " for " + escapeHTML(roc.name) + "' " +
+							"title='" + (turnLEDOff ? "Turn off the KEY LED on " :
+								"Restore normal KEY LED behavior on ") + escapeHTML(roc.name) + "' " +
+							(ledTarget && !_globalBusy ? "" : "disabled ") +
+							"onclick=\"toggleROCLED('" + escapeJS(roc.name) + "',event)\">LED " + ledAction + "</button></div>";
 					}
 					if (!dtc.rocs.length)
 						html += "<span class='placeholder-text'>No ROCs configured.</span>";
@@ -363,6 +377,77 @@
 
 			document.getElementById("dtcGrid").innerHTML = html ||
 				"<div class='placeholder-text'>No tracker DTCs were found.</div>";
+		}
+
+		function rocLEDTarget(uid, turnOff) {
+			// Resolve one configured ROC only; never let the macro default to all links.
+			if (typeof uid !== "string" || typeof turnOff !== "boolean") return null;
+			var identity = uid.match(/^(Trk\d+_DTC\d+)_ROC([0-5])$/);
+			if (!identity) return null;
+			var dtcs = trackerDTCs().filter(function (dtc) {
+				return dtc.name === identity[1] && dtc.enabled && dtc.rocs.some(function (roc) {
+					return roc.name === uid && roc.enabled === "1";
+				});
+			});
+			if (dtcs.length !== 1) return null;
+			var info = Mu2eHardware.getROCMacros(uid);
+			if (!info || info.dtcUID !== identity[1] || info.linkIndex !== Number(identity[2]))
+				return null;
+			var macro = info.macros && info.macros["ROC Write"];
+			if (!macro || !Array.isArray(macro.inputs) || macro.inputs.length !== 3 ||
+				macro.inputs.indexOf("address") < 0 || macro.inputs.indexOf("writeData") < 0)
+				return null;
+			var linkInputs = macro.inputs.filter(function (name) {
+				return /^Target ROC or Mask\b/.test(name);
+			});
+			if (linkInputs.length !== 1) return null;
+			var inputs = {address: "0x09", writeData: turnOff ? "0x01" : "0x00"};
+			inputs[linkInputs[0]] = String(info.linkIndex);
+			return {dtcUID: info.dtcUID, inputs: inputs};
+		}
+
+		function rocLEDWriteSucceeded(result, dtcUID, turnOff) {
+			if (!result || result.error || !Array.isArray(result.targets) ||
+				result.targets.length !== 1 || result.targets[0].uid !== dtcUID)
+				return false;
+			var outputs = result.targets[0].outputs || {};
+			var written = String(outputs.Result || "").match(
+				/^Wrote Data ([01])\(0x\s*([01])\) to ROC Address 9\(0x0*9\) for ROC\(s\):\s*$/i);
+			return typeof turnOff === "boolean" && !!written &&
+				written[1] === (turnOff ? "1" : "0") && written[2] === written[1];
+		}
+
+		function toggleROCLED(uid, event) {
+			if (event) event.stopPropagation();
+			if (_globalBusy) return;
+			var turnOff = _rocLEDLastCommand[uid] !== "off";
+			var ledAction = turnOff ? "off" : "on";
+			var target = rocLEDTarget(uid, turnOff);
+			var entryId = createOutputEntry();
+			if (!target) {
+				updateOutputEntry(entryId, "<div class='badValue'>KEY LED control is unavailable for " +
+					escapeHTML(uid) + ". Refresh the page after configuring the tracker.</div>");
+				return;
+			}
+			beginDTCCommand(target.dtcUID, true);
+			setGlobalDisabled(true);
+			updateOutputEntry(entryId, "<div class='tracker-running'>Turning the KEY LED " + ledAction + " on " +
+				escapeHTML(uid) + "...</div>");
+			function complete(result) {
+				var success = rocLEDWriteSucceeded(result, target.dtcUID, turnOff);
+				if (success) _rocLEDLastCommand[uid] = ledAction;
+				finishDTCCommand(target.dtcUID, success, true);
+				setGlobalDisabled(false);
+				updateOutputEntry(entryId, "<div class='" + (success ? "goodValue" : "badValue") + "'>" +
+					"KEY LED " + ledAction + (success ? " command sent to " : " command failed or was not confirmed for ") +
+					escapeHTML(uid) + ".</div>" +
+					Mu2eHardware.formatMacroResult("ROC Write", result, uid));
+			}
+			try {
+				Mu2eHardware.runMacro(target.dtcUID, "ROC Write", target.inputs, complete);
+			} catch (e) {
+				complete({error: e.message || String(e), targets: []});
+			}
 		}
 
 		function toggleDTC(uid, event) {
