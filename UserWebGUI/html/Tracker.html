@@ -13,8 +13,11 @@
 	<script type="text/JavaScript" src="/WebPath/js/Debug.js"></script>
 	<script type="text/JavaScript" src="/WebPath/js/DesktopContent.js"></script>
 	<script type="text/JavaScript" src="/WebPath/js/js_lib/ConfigurationAPI.js"></script>
+	<script type="text/JavaScript" src="../js/TrackerRateMask.js?v=applied-groups-20261019-1"></script>
+	<script type="text/JavaScript" src="../js/TrackerRatesRun.js?v=iterator-20261009-1"></script>
 	<script type="text/JavaScript" src="/WebPath/UserWebPath/js/Mu2e.js"></script>
-	<script type="text/JavaScript" src="../js/TrackerHardware.js"></script>
+	<script type="text/JavaScript" src="../js/TrackerHardware.js?v=20261019-link-summary-1"></script>
+	<script type="text/JavaScript" src="../js/TrackerTestFlight.js?v=20261019-dtc-list-1"></script>
 	<style>
 		.tracker-counters-scroll { overflow-x: auto; margin: 6px 0 16px; }
 		.tracker-counters-table { border-collapse: collapse; font-size: 12px; white-space: nowrap; }
@@ -33,7 +36,7 @@
 	<script>
 		var _structureReady = false;
 		var _macrosReady = false;
-		var _expandedDTCs = {};
+		var _expandedDTC = null;
 		var _selectedUID = null;
 		var _activeMacros = null;
 		var _macroRunTarget = null;
@@ -51,6 +54,7 @@
 		var _expandedActionGroups = {};
 
 		function init() {
+			if (_globalBusy) return;
 			Debug.log("Tracker controls init()");
 			DesktopContent.tooltip("Tracker Controls",
 				"Select a tracker DTC to open its ROCs and controls. " +
@@ -67,19 +71,23 @@
 				commandOutput.innerHTML =
 					"<div class='tracker-empty-output'>Run a global, DTC, or ROC command to see its output.</div>";
 			renderGlobalActions();
+            refreshTrackerRatesRunStatus();
 
-			Mu2eHardware.fetchActiveConfig(function (cfg) {
-				var el = document.getElementById("activeConfigInfo");
-				if (!el || !cfg || !cfg.config) return;
-				var text = cfg.config.groupName + " (" + cfg.config.groupKey + ")";
-				if (cfg.configAlias) text = cfg.configAlias + " — " + text;
-				el.textContent = text;
-			});
-
-			Mu2eHardware.fetchStructure(function () {
-				_structureReady = true;
-				if (_macrosReady) renderDTCGrid();
-			});
+            Mu2eHardware.fetchStructure(function (structure) {
+                _structureReady = true;
+                if (structure && structure.groups && structure.groups.configuration) {
+                    var active = structure.groups.configuration;
+                    var el = document.getElementById("activeConfigInfo");
+                    el.textContent = "Configured: " + (active.alias ? active.alias + " — " : "") + active.name + " (" + active.key + ")";
+                    var selected = structure.groups.selected;
+                    if (selected && (!TrackerRateMask.sameGroup(active, selected) || !TrackerRateMask.sameGroup(active.context, selected.context))) {
+                        var pending = document.createElement("div");
+                        pending.textContent = "Selected on disk: " + selected.name + " (" + selected.key + "); not applied by Configure.";
+                        el.appendChild(pending);
+                    }
+                }
+                if (_macrosReady) renderDTCGrid();
+            });
 
 			Mu2eHardware.fetchMacroList(function () {
 				_macrosReady = true;
@@ -143,6 +151,7 @@
 		}
 
 		function clearOutputHistory() {
+			if (_globalBusy) return;
 			var output = document.getElementById("commandOutput");
 			output.innerHTML =
 				"<div class='tracker-empty-output'>Run a global, DTC, or ROC command to see its output.</div>";
@@ -232,10 +241,10 @@
 		}
 
 		function commandSucceeded(macroName, result, counterLinks) {
-			if (!result || result.error) return false;
+			if (!result || result.error || !Mu2eHardware.rocLinkSummariesSucceeded(result)) return false;
 			if (macroName === "ROC FEMacro - Find and serialize thresholds")
 				return Mu2eHardware.thresholdScanSucceeded(result);
-			if (macroName === "Get DTC Counters")
+			if (macroName === "ROC FEMacro - Get DTC Counter Values")
 				return counterLinks ? Mu2eHardware.checkDTCCounters(result, counterLinks).success :
 					Mu2eHardware.parseDTCCounters(result).errors.length === 0;
 			if (/Get Link Lock Status$/i.test(macroName || ""))
@@ -306,7 +315,7 @@
 
 			for (var i = 0; i < dtcs.length; ++i) {
 				var dtc = dtcs[i];
-				var open = !!_expandedDTCs[dtc.name];
+				var open = _expandedDTC === dtc.name;
 				var selected = _selectedUID === dtc.name;
 				var commandState = _dtcCommandState[dtc.name];
 				var dotClass = dtc.enabled ? "status-on" : "status-off";
@@ -357,18 +366,20 @@
 		}
 
 		function toggleDTC(uid, event) {
+			if (_globalBusy) return;
 			if (event) event.stopPropagation();
-			_expandedDTCs[uid] = !_expandedDTCs[uid];
+			_expandedDTC = _expandedDTC === uid ? null : uid;
 			_selectedUID = uid;
 			renderDTCGrid();
 			renderSelection(uid);
 		}
 
 		function selectROC(uid, event) {
+			if (_globalBusy) return;
 			if (event) event.stopPropagation();
 			_selectedUID = uid;
 			var parent = Mu2eHardware.getParentDTC(uid);
-			if (parent) _expandedDTCs[parent] = true;
+			if (parent) _expandedDTC = parent;
 			renderDTCGrid();
 			renderSelection(uid);
 		}
@@ -448,6 +459,7 @@
 		}
 
 		function prepareMacro(macroName) {
+			if (_globalBusy) return;
 			var output = document.getElementById("selectionInputs");
 			var macro = _activeMacros && _activeMacros[macroName];
 			if (!output || !macro) return;
@@ -479,6 +491,7 @@
 		}
 
 		function runPreparedMacro() {
+			if (_globalBusy) return;
 			var output = document.getElementById("selectionInputs");
 			var inputs = {};
 			try { inputs = JSON.parse(output.getAttribute("data-implicit") || "{}"); }
@@ -497,9 +510,7 @@
 				return "Adjust CAL/HV threshold DACs on " + _selectedUID +
 					" and save per-panel JSON files? Existing files get .bak copies. Data taking must be stopped.";
 			if (macroName === "ROC FEMacro - Deserialize and set thresholds")
-				return "Program configured thresholds on " + _selectedUID +
-					"?\n\nThis writes all configured Cal and HV threshold DACs. " +
-					"Run only when tracker data taking is stopped.";
+				return "";
 			if (/reset|\bwrite\b/i.test(macroName))
 				return "Run " + Mu2eHardware.macroDisplayName(macroName) +
 					" on " + _selectedUID + "?";
@@ -507,6 +518,7 @@
 		}
 
 		function runSelectedMacro(macroName, inputs) {
+			if (_globalBusy) return;
 			var confirmation = confirmationText(macroName);
 			if (confirmation && !window.confirm(confirmation)) return;
 			var outputEntryId = createOutputEntry();
@@ -539,8 +551,11 @@
 		}
 
 		var GLOBAL_ACTIONS = {
+            "rates-run": {label: "NoiseRun", ratesRun: true},
+			"rate-masks": {label: "Rate Masks", rateMasks: true},
+			"testflight": {label: "TestFlight", testFlight: true},
 			"counters": {
-				label: "Counters", macro: "Get DTC Counters", inputs: {}, counters: true
+				label: "Counters", macro: "ROC FEMacro - Get DTC Counter Values", inputs: {}, counters: true
 			},
 			"status": {
 				label: "Status", status: true
@@ -572,9 +587,7 @@
 			},
 			"set-thresholds": {
 				label: "Set Thresholds", macro: "ROC FEMacro - Deserialize and set thresholds",
-				allROCs: true, validateOnly: false,
-				confirm: "Program configured thresholds on every enabled tracker ROC?\n\n" +
-					"This writes all Cal and HV DACs and is not atomic. Run only when data taking is stopped."
+				allROCs: true, validateOnly: false
 			}
 		};
 
@@ -585,12 +598,16 @@
 			var available = [];
 			for (var i = 0; i < allowed.length; ++i)
 				if (GLOBAL_ACTIONS[allowed[i]]) available.push(allowed[i]);
+			if (available.indexOf("rate-masks") < 0) available.splice(Math.min(6, available.length), 0, "rate-masks");
+			if (available.indexOf("testflight") < 0) available.splice(2, 0, "testflight");
+			if (available.indexOf("rates-run") < 0) available.unshift("rates-run");
 			var visible = visibleActionNames(available, "tracker");
 			var html = "";
 			for (var i = 0; i < visible.length; ++i) {
 				var actionKey = visible[i];
 				var action = GLOBAL_ACTIONS[actionKey];
 				html += "<button class='macro-btn-primary' type='button' " +
+                    (actionKey === "rates-run" ? "id='trackerNoiseRunAction' " : "") +
 					"onclick=\"runGlobalAction('" + actionKey + "')\">" +
 					escapeHTML(action.label) + "</button>";
 			}
@@ -601,8 +618,270 @@
 		function setGlobalDisabled(disabled) {
 			_globalBusy = disabled;
 			renderDTCGrid();
-			var buttons = document.querySelectorAll("#globalActions button");
+			var buttons = document.querySelectorAll("#globalActions button, #globalInputs input, #globalInputs select, #globalInputs button, #selectionPanel button, #trackerHeader button");
 			for (var i = 0; i < buttons.length; ++i) buttons[i].disabled = disabled;
+            if (_ratesRunOwnsPage) updateTrackerRatesRunControls();
+		}
+
+
+
+        var _ratesRunOwnsPage = false, _ratesRunState = null, _ratesRunDeps = null;
+        var _ratesRunRequest = false, _ratesRunTimer = null, _ratesRunEntry = null;
+        var _ratesRunConnectionError = '';
+        function showTrackerRatesRunMenu() {
+            if (_globalBusy && !_ratesRunOwnsPage) return;
+            document.getElementById('globalInputs').innerHTML = "<div class='macro-input-form'><b>NoiseRun</b>" +
+                "<p>The OTS Iterator reads all 96 channels, including masked channels, on enabled tracker ROCs, " +
+                "with DTCs in parallel. Scans start every 3 seconds or after a longer scan finishes; complete totals go to Grafana. " +
+                "The run continues after this page closes or your tunnels disconnect. Reopen NoiseRun to view status or Stop.</p>" +
+                "<p>DAQ must be Configured and stopped. Measurement temporarily changes masks and readout settings, " +
+                "then restores and checks masks. Initialize readout before normal data taking.</p>" +
+                "<div id='ratesRunStatus' aria-live='polite'></div>" +
+                "<button id='ratesRunStart' type='button' onclick='startTrackerRatesRun()' disabled>Start</button> " +
+                "<button id='ratesRunStop' type='button' onclick='stopTrackerRatesRun()' disabled>Stop</button> " +
+                "<button id='ratesRunClose' type='button' onclick='closeTrackerRatesRunMenu()'>Close</button></div>";
+            updateTrackerRatesRunControls();
+            refreshTrackerRatesRunStatus();
+        }
+        function closeTrackerRatesRunMenu() { document.getElementById('globalInputs').innerHTML = ''; }
+        function updateTrackerRatesRunControls() {
+            var start=document.getElementById('ratesRunStart'), stop=document.getElementById('ratesRunStop');
+            var close=document.getElementById('ratesRunClose'), status=document.getElementById('ratesRunStatus');
+            var action=document.getElementById('trackerNoiseRunAction');
+            if (action && _ratesRunOwnsPage) action.disabled=false;
+            if (start) start.disabled=_ratesRunRequest || !!_ratesRunConnectionError || !_ratesRunState || _ratesRunState.owned || _ratesRunState.planStatus!=='Inactive';
+            if (stop) stop.disabled=_ratesRunRequest || !_ratesRunOwnsPage || (_ratesRunState && _ratesRunState.state==='Stopping');
+            if (close) close.disabled=false;
+            var message=_ratesRunConnectionError || (!_ratesRunState ? 'Checking Iterator status…' :
+                _ratesRunState.owned ? 'Iterator NoiseRun: '+_ratesRunState.state+'. '+(_ratesRunState.error || '') :
+                _ratesRunState.planStatus!=='Inactive' ? 'Iterator is busy with '+_ratesRunState.plan+'.' : 'NoiseRun is stopped.');
+            var last=_ratesRunState && _ratesRunState.summary;
+            if (last) message+=' Last tracker total: '+(last.total_hz/1000).toFixed(3)+' kHz; '+last.channels+' channels, '+last.dtcs.length+' DTCs; '+_ratesRunState.scans+' scans sent.';
+            if (status) status.textContent=message;
+            if (_ratesRunEntry!==null) updateOutputEntry(_ratesRunEntry,'<p><b>NoiseRun:</b> '+escapeHTML(message)+'</p>'+
+                (_ratesRunState && _ratesRunState.excluded ? '<p>Excluded ROCs: '+escapeHTML(_ratesRunState.excluded)+'.</p>' : '')+
+                '<p>Initialize readout before normal data taking.</p>');
+        }
+        async function refreshTrackerRatesRunStatus() {
+            if (_ratesRunRequest) return;
+            _ratesRunRequest=true;
+            try {
+                if (!_ratesRunDeps) _ratesRunDeps=await TrackerRatesRun.browserDependencies();
+                _ratesRunState=await _ratesRunDeps.status(); _ratesRunConnectionError='';
+                if (_ratesRunState.owned!==_ratesRunOwnsPage) {
+                    _ratesRunOwnsPage=_ratesRunState.owned;
+                    setGlobalDisabled(_ratesRunOwnsPage);
+                }
+                if (_ratesRunState.owned && _ratesRunEntry===null) _ratesRunEntry=createOutputEntry();
+            } catch(e) {
+                _ratesRunConnectionError=e.message;
+                // A failed status read never means the server stopped. Preserve ownership.
+            } finally {
+                _ratesRunRequest=false; updateTrackerRatesRunControls();
+                clearTimeout(_ratesRunTimer); _ratesRunTimer=setTimeout(refreshTrackerRatesRunStatus,2000);
+            }
+        }
+        async function startTrackerRatesRun() {
+            if (_globalBusy || _ratesRunRequest || !_ratesRunDeps) return;
+            try { testFlightIdle(); } catch(e) { _ratesRunConnectionError=e.message; updateTrackerRatesRunControls(); return; }
+            _ratesRunRequest=true; _ratesRunOwnsPage=true; setGlobalDisabled(true);
+            _ratesRunEntry=createOutputEntry(); _ratesRunConnectionError='Start requested; checking Iterator acceptance…'; updateTrackerRatesRunControls();
+            try { await _ratesRunDeps.start(); }
+            catch(e) { _ratesRunConnectionError=e.message; }
+            finally { _ratesRunRequest=false; await refreshTrackerRatesRunStatus(); }
+        }
+        async function stopTrackerRatesRun() {
+            if (_ratesRunRequest || !_ratesRunDeps || !_ratesRunOwnsPage) return;
+            _ratesRunRequest=true; updateTrackerRatesRunControls();
+            try { await _ratesRunDeps.stop(); }
+            catch(e) { _ratesRunConnectionError=e.message; }
+            finally { _ratesRunRequest=false; await refreshTrackerRatesRunStatus(); }
+        }
+
+        var _testFlightReports = {}, _testFlightControl = null;
+        var _testFlightDuration = "1ms", _testFlightMarkers = "1000";
+        function showTestFlightMenu() {
+            if (_globalBusy) return;
+            document.getElementById("globalInputs").innerHTML = "<div class='macro-input-form'><b>TestFlight</b>" +
+                "<div class='macro-input-row'><label for='testFlightDuration'>Window duration:</label><input id='testFlightDuration' value='" + escapeHTML(_testFlightDuration) + "'></div>" +
+                "<div class='macro-input-row'><label for='testFlightMarkers'>Number of markers:</label><input id='testFlightMarkers' type='number' min='2' max='4294967295' step='1' value='" + escapeHTML(_testFlightMarkers) + "'></div>" +
+                "<p>Start all enabled tracker DTC readers, send CFO markers, then report counter increases and stop readers started by this test. Run while DAQ is Configured and stopped.</p>" +
+                "<div id='testFlightError' class='badValue'></div>" +
+                "<button class='macro-run-btn' type='button' onclick='runTestFlight()'>Run</button> " +
+                "<button class='macro-run-btn' type='button' onclick='checkTestFlightReadiness()'>Check readiness</button> " +
+                "<button id='testFlightStop' class='macro-run-btn' type='button' onclick='stopTestFlight()' disabled>Stop Test</button> " +
+                "<button class='macro-run-btn' type='button' onclick='closeTestFlightMenu()'>Close</button></div>";
+        }
+        function closeTestFlightMenu() {
+            if (_globalBusy) return;
+            _testFlightDuration = document.getElementById("testFlightDuration").value;
+            _testFlightMarkers = document.getElementById("testFlightMarkers").value;
+            document.getElementById("globalInputs").innerHTML = "";
+        }
+        function testFlightIdle() {
+            if (Object.keys(_dtcCommandState).some(function(uid) { return _dtcCommandState[uid].pending > 0; }))
+                throw new Error("Wait for the current DTC command to finish.");
+            if (Mu2eHardware.hasUnsavedChanges()) throw new Error("Save or discard pending tracker edits first.");
+        }
+        async function checkTestFlightReadiness() {
+            if (_globalBusy) return;
+            var error = document.getElementById("testFlightError");
+            try {
+                testFlightIdle(); setGlobalDisabled(true); error.textContent = "Checking configuration and available macros…";
+                var deps = await TrackerTestFlight.browserDependencies();
+                var session = await deps.prepare(); await deps.guard(session);
+                error.textContent = "Ready: " + session.targets.length + " enabled DTCs; CFO " + session.cfo.uid + " at " + session.cfo.origin + ". Normal Start reloads its production plan. No test was launched.";
+            } catch(e) { error.textContent = e.message; }
+            finally { setGlobalDisabled(false); document.getElementById("testFlightStop").disabled = true; }
+        }
+        async function runTestFlight() {
+            if (_globalBusy) return;
+            var error = document.getElementById("testFlightError"), options;
+            try { testFlightIdle(); options = TrackerTestFlight.options(document.getElementById("testFlightDuration").value, document.getElementById("testFlightMarkers").value); }
+            catch(e) { error.textContent = e.message; return; }
+            _testFlightDuration = options.duration; _testFlightMarkers = String(options.markers);
+            var entry = createOutputEntry(), report = {}, control = {stop:false};
+            _testFlightControl = control; _testFlightReports[entry] = report;
+            setGlobalDisabled(true); document.getElementById("testFlightStop").disabled = false; error.textContent = "";
+            function show(message) { updateOutputEntry(entry, TrackerTestFlight.render(report, message, entry)); }
+            try {
+                show("Checking readiness…");
+                var deps = await TrackerTestFlight.browserDependencies();
+                await TrackerTestFlight.run(deps, options, report, show, control);
+                show(report.success ? "Completed — all enabled ROC counters matched." : "Finished — inspect the errors, counter differences and cleanup below.");
+            } catch(e) { report.error = e.message; show("Stopped before launching the test."); }
+            finally {
+                _testFlightControl = null; setGlobalDisabled(false); document.getElementById("testFlightStop").disabled = true;
+            }
+        }
+        function stopTestFlight() {
+            if (!_testFlightControl) return;
+            _testFlightControl.stop = true;
+            document.getElementById("testFlightStop").disabled = true;
+            document.getElementById("testFlightError").textContent = "Stopping after the current requests finish, then cleaning up…";
+        }
+        function downloadTestFlightReport(entry) {
+            var report = _testFlightReports[entry]; if (!report) return;
+            var url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], {type:"application/json"}));
+            var a = document.createElement("a"); a.href = url; a.download = "TestFlight-" + (report.started_at || new Date().toISOString()).replace(/[:.]/g,"-") + ".json";
+            a.click(); setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+        }
+
+		var _rateMaskReports = {};
+		var _rateMaskThreshold = "10";
+		var _rateMaskAction = "mask";
+		function showTrackerRateMaskMenu() {
+			if (_globalBusy) return;
+			var panel = document.getElementById("globalInputs");
+			panel.innerHTML = "<div id='trackerRateMaskControls' class='macro-input-form'><b>Rate Masks</b>" +
+				"<div class='macro-input-row'><label for='trackerRateThreshold'>Rate threshold (kHz):</label>" +
+				"<input id='trackerRateThreshold' type='number' min='0' step='any' value='" + escapeHTML(_rateMaskThreshold) + "'></div>" +
+				"<div class='macro-input-row'><label for='trackerRateAction'>Action:</label>" +
+				"<select id='trackerRateAction'><option value='mask'>Mask and activate</option><option value='rebalance'>Mask above + enable below, activate</option><option value='report'>Report only</option></select></div>" +
+				"<p>Report only lists enabled straws above the threshold and disabled straws below it, using the current channel table. Straws exactly at the threshold are excluded. Reporting does not change the configuration or re-enable channels.</p>" +
+				"<p>Measure DTCs in parallel, checking every enabled tracker ROC. For Mask and activate, after all measurements finish, record channels above the threshold, download the current channel-table CSV, change their Enabled cells to No, upload the CSV and activate the new configuration. The Mask above + enable below option also changes measured disabled straws strictly below the threshold to Yes. Unmeasured channels and excluded ROCs remain unchanged.</p>" +
+				"<p>Run while DAQ is stopped and Configured. Rate measurement changes readout settings; initialize readout before the next run.</p>" +
+				"<div id='trackerRateMaskError' class='badValue'></div>" +
+				"<button class='macro-run-btn' type='button' onclick='runTrackerRateMask()'>Run</button> " +
+				"<button class='macro-run-btn' type='button' onclick='closeTrackerRateMaskMenu()'>Close</button></div>";
+			document.getElementById("trackerRateAction").value = _rateMaskAction;
+			if (panel.scrollIntoView) panel.scrollIntoView({block: "nearest"});
+		}
+		function closeTrackerRateMaskMenu() {
+			if (_globalBusy) return;
+			_rateMaskThreshold = document.getElementById("trackerRateThreshold").value;
+			_rateMaskAction = document.getElementById("trackerRateAction").value;
+			document.getElementById("globalInputs").innerHTML = "";
+		}
+		async function runTrackerRateMask() {
+			if (_globalBusy) return;
+			if (Object.keys(_dtcCommandState).some(function (uid) { return _dtcCommandState[uid].pending > 0; })) {
+				Debug.log("Wait for the current DTC command to finish.", Debug.HIGH_PRIORITY); return;
+			}
+			if (Mu2eHardware.hasUnsavedChanges()) {
+				Debug.log("Save or discard pending tracker edits before scanning rates.", Debug.HIGH_PRIORITY); return;
+			}
+			var threshold;
+			try { threshold = TrackerRateMask.threshold(document.getElementById("trackerRateThreshold").value); }
+			catch (e) { document.getElementById("trackerRateMaskError").textContent = e.message; return; }
+			_rateMaskThreshold = document.getElementById("trackerRateThreshold").value;
+			_rateMaskAction = document.getElementById("trackerRateAction").value;
+			document.getElementById("trackerRateMaskError").textContent = "";
+			var entry = createOutputEntry();
+			var reportOnly = document.getElementById("trackerRateAction").value === "report";
+			var reenableBelow = _rateMaskAction === "rebalance";
+			var report = {area: "Tracker", report_only: reportOnly, reenable_below_threshold: reenableBelow, changes: [], rates: []};
+			_rateMaskReports[entry] = report;
+			setGlobalDisabled(true);
+			function show(message, error) {
+				var html = "<div class='batch-summary'><b>" + (reportOnly ? "Rate report" : "Rate masks") + " — " + threshold + " kHz</b><p class='" +
+					(error ? "badValue" : "") + "'>" + escapeHTML(message) + "</p>";
+				if (report.originalGroup) html += "<p>" + (reportOnly ? "Source configuration: " : "Rollback configuration: ") + escapeHTML(report.originalGroup.name) +
+					"(" + escapeHTML(report.originalGroup.key) + ").</p>";
+				if (report.savedTableVersion) html += "<p>Saved channel table version: " + escapeHTML(report.savedTableVersion) + ".</p>";
+				if (report.savedGroup) html += "<p>New configuration: " + escapeHTML(report.savedGroup.name) +
+					"(" + escapeHTML(report.savedGroup.key) + "), " + (report.activated ? "active" : "activation not verified") + ".</p>";
+				if (report.targets) html += "<p>Coverage: " + report.targets.length + " DTCs, " +
+					report.targets.reduce(function (n, t) { return n + t.rocs.length; }, 0) + " enabled ROCs; " + report.rates.length + " measured channels.</p>";
+				if (report.unmeasured_hosts && report.unmeasured_hosts.length) html += "<p>Unmeasured hosts: " + escapeHTML(report.unmeasured_hosts.join(", ")) + ".</p>";
+				if (report.excluded_rocs && report.excluded_rocs.length) html += "<details><summary>Excluded ROCs (" + report.excluded_rocs.length + ")</summary>" + escapeHTML(report.excluded_rocs.join(", ")) + "</details>";
+				if (report.measurement_started) html += "<p>Readout initialization is required before the next run.</p>";
+				if (report.enabled_above_threshold && report.disabled_below_threshold) {
+				    [{label: "Enabled straws above threshold", rows: report.enabled_above_threshold},
+				     {label: "Disabled straws below threshold", rows: report.disabled_below_threshold}].forEach(function (list) {
+				        html += "<details><summary>" + list.label + " (" + list.rows.length + ")</summary>";
+				        if (list.rows.length) {
+				            html += "<table class='settings-table'><tr><th>ROC / MN panel</th><th>Channel</th><th>Total (kHz)</th><th>Configured Enabled</th></tr>";
+				            list.rows.forEach(function (r) {
+				                html += "<tr><td>" + escapeHTML(r.uid + " / " + r.panel) + "</td><td>" + r.channel + "</td><td>" + r.total_khz + "</td><td>" + escapeHTML(r.enabled) + "</td></tr>";
+				            });
+				            html += "</table>";
+				        } else html += "<p>No matching straws.</p>";
+				        html += "</details>";
+				    });
+				}
+				if (report.activated) html += "<p>Use this new group key for the next Configure. Existing aliases still select their prior keys.</p>";
+                [{label: "Newly disabled channels", rows: report.newly_disabled || []},
+                 {label: "Newly enabled channels", rows: report.newly_enabled || []}].forEach(function (list) {
+                    if (!list.rows.length) return;
+                    html += "<details><summary>" + list.label + " (" + list.rows.length + ")</summary><table class='settings-table'><tr><th>ROC / Panel</th><th>Channel</th><th>Total (kHz)</th></tr>";
+                    list.rows.forEach(function (r) { html += "<tr><td>" + escapeHTML(r.uid + " / " + r.panel) + "</td><td>" + r.channel + "</td><td>" + r.total_khz + "</td></tr>"; });
+                    html += "</table></details>";
+                });
+				html += "<button type='button' onclick=\"downloadTrackerRateMaskReport('" + entry + "')\">" + (reportOnly ? "Download rate report" : "Download scan and rollback report") + "</button></div>";
+				if (report.originalCSV) html += "<button type='button' onclick=\"downloadTrackerRateMaskCSV('" + entry + "',false)\">Download original CSV</button> ";
+				if (report.editedCSV) html += "<button type='button' onclick=\"downloadTrackerRateMaskCSV('" + entry + "',true)\">Download edited CSV</button>";
+				updateOutputEntry(entry, html);
+			}
+			try {
+				if (reportOnly && TrackerRateMask.supportsReportOnly !== true) throw new Error("Reload Tracker to load the report-only implementation before running.");
+				if (reenableBelow && TrackerRateMask.supportsReenableBelow !== true) throw new Error("Reload Tracker to load the re-enable option before running.");
+				var deps = await TrackerRateMask.browserDependencies();
+				await TrackerRateMask.run(deps, threshold, report, function (message) { show(message, false); }, {reportOnly: reportOnly, reenableBelow: reenableBelow});
+				show(reportOnly ? "Rate report complete; configuration unchanged." : report.no_changes ? "No channel changes needed; configuration unchanged." : "Channel-table CSV uploaded, verified, and configuration activated.", false);
+				if (report.activated) document.getElementById("activeConfigInfo").textContent =
+                    "Configured: " + report.originalGroup.name + " (" + report.originalGroup.key + "). Selected on disk: " + report.savedGroup.name + " (" + report.savedGroup.key + "); not applied by Configure.";
+			} catch (e) {
+				report.error = e.message;
+				show("Stopped: " + e.message + (report.save_started ? " Inspect the saved versions and active group before retrying." : " No configuration was saved or activated."), true);
+			} finally { setGlobalDisabled(false); if (_selectedUID) renderSelection(_selectedUID); }
+		}
+
+		function downloadTrackerRateMaskReport(entry) {
+			if (!_rateMaskReports[entry]) return;
+			var blob = new Blob([JSON.stringify(_rateMaskReports[entry], null, 2)], {type: "application/json"});
+			var url = URL.createObjectURL(blob), a = document.createElement("a");
+			a.href = url; a.download = "tracker-rate-masks-" + new Date().toISOString().replace(/[:.]/g, "-") + ".json";
+			a.click(); window.setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+		}
+		function downloadTrackerRateMaskCSV(entry, edited) {
+			var report = _rateMaskReports[entry];
+			if (!report || !(edited ? report.editedCSV : report.originalCSV)) return;
+			var blob = new Blob([edited ? report.editedCSV : report.originalCSV], {type: "text/csv;charset=utf-8"});
+			var url = URL.createObjectURL(blob), a = document.createElement("a");
+			a.href = url;
+			a.download = "SubsystemTrackerChannelsTable-" + (edited ? "edited" : "original-v" + report.originalTable.version) + ".csv";
+			a.click(); window.setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
 		}
 
 		function renderFailureSummary(label, total, completed, failed, complete, unit) {
@@ -905,9 +1184,13 @@
 		}
 
 		function runGlobalAction(key, thresholdSettings, dtcUID) {
+            if (key === "rates-run") { showTrackerRatesRunMenu(); return; }
 			if (_globalBusy) return;
 			var action = GLOBAL_ACTIONS[key];
 			if (!action) return;
+            if (action.ratesRun) { showTrackerRatesRunMenu(); return; }
+			if (action.rateMasks) { showTrackerRateMaskMenu(); return; }
+			if (action.testFlight) { showTestFlightMenu(); return; }
 			var thresholdTargets, thresholdInputs;
 			if (action.thresholdScan) {
 				if (!thresholdSettings) { showGlobalThresholdForm(dtcUID); return; }
@@ -960,6 +1243,7 @@
 			Mu2eHardware.runMacroOnUIDs(_globalTargets, action.macro,
 				function (uid) {
 					if (action.thresholdScan) return thresholdInputs[uid];
+					if (action.counters) return Mu2eHardware.getDTCCounterInputs(uid, _globalCounterLinks[uid]);
 					var inputs = action.inputs || {};
 					if (action.allROCs) {
 						inputs = Mu2eHardware.getAllROCInputs(uid, action.macro);

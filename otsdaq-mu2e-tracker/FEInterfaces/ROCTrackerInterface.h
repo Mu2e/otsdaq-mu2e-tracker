@@ -64,6 +64,7 @@ public:
 	void InitReadout(__ARGS__);
 	void ReadRegister(__ARGS__);
 	void ResetCounters(__ARGS__);
+	void GetDTCCounterValues(__ARGS__);
 	void FindAlignment(__ARGS__);
 	void SetThreshold(__ARGS__);
 	void MeasureThreshold(__ARGS__);
@@ -96,6 +97,7 @@ public:
 	void ReadSPI(__ARGS__);
 	void PrintStatus(__ARGS__);
   void MeasureChannelRates(__ARGS__);
+  void PublishRateSummary(__ARGS__);
 
 	void FindAndSerializeThresholds(__ARGS__);
 	void DeserializeAndSetThresholds(__ARGS__);

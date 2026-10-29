@@ -7,9 +7,11 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <locale>
 #include <stdexcept>
 
 #include "otsdaq-mu2e-tracker/FEInterfaces/ROCTrackerInterface.h"
+#include "otsdaq-mu2e-tracker/FEInterfaces/TrackerRatePublisher.h"
 #include "otsdaq/ConfigurationInterface/ConfigurationManagerRW.h"
 #include "otsdaq/Macros/InterfacePluginMacros.h"
 
@@ -38,6 +40,18 @@ ROCTrackerInterface::ROCTrackerInterface(
 	                        std::vector<std::string>{"Value"},
 	                        1,
 	                        "" /* tooltip info here */);
+
+	registerFEMacroFunction(
+	    "Get DTC Counter Values",
+	    static_cast<FEVInterface::frontEndMacroFunction_t>(
+	        &ROCTrackerInterface::GetDTCCounterValues),
+	    std::vector<std::string>{},
+	    std::vector<std::string>{"Counter Values"},
+	    1,
+	    "Read four parent-DTC counters for each ROC link 0-5 as versioned JSON. "
+	    "Select one enabled ROC interface to route the request; no ROC transaction "
+	    "is performed. Reads are sequential, not an atomic snapshot. "
+	    "Does not reset counters or change DTC configuration.");
 
 	registerFEMacroFunction("Reset Counters",
 	                        static_cast<FEVInterface::frontEndMacroFunction_t>(
@@ -344,6 +358,17 @@ ROCTrackerInterface::ROCTrackerInterface(
 	                        "" /* tooltip info here */);
 
 	registerFEMacroFunction(
+	    "Publish Rate Summary",
+	    static_cast<FEVInterface::frontEndMacroFunction_t>(
+	        &ROCTrackerInterface::PublishRateSummary),
+	    std::vector<std::string>{"Summary JSON"},
+	    std::vector<std::string>{"Published"},
+	    1,
+	    "Send a validated complete tracker rate summary to Graphite for Grafana. "
+	    "No ROC/DTC hardware access. Published=1 confirms TCP send, not database "
+	    "storage.");
+
+	registerFEMacroFunction(
 	    "Measure Channel Rates",
 	    static_cast<FEVInterface::frontEndMacroFunction_t>(
 	        &ROCTrackerInterface::MeasureChannelRates),
@@ -644,6 +669,31 @@ void ROCTrackerInterface::ReadRegister(__ARGS__)
 	__SET_ARG_OUT__("Value", std::to_string(rv));
 }
 
+void ROCTrackerInterface::GetDTCCounterValues(__ARGS__)
+{
+	auto dtc = getDTC();
+	// Fixed keys and uint32_t values need no string escaping. JSON avoids the
+	// FE macro transport's automatic "decimal (hex)" formatting of scalar outputs.
+	std::ostringstream values;
+	values.imbue(std::locale::classic());
+	values << "{\"schemaVersion\":1,\"links\":[";
+	for(size_t i = 0; i < DTCLib::DTC_ROC_Links.size(); ++i)
+	{
+		const auto link = DTCLib::DTC_ROC_Links[i];
+		if(i)
+			values << ",";
+		values << "{\"link\":" << static_cast<unsigned int>(link)
+		       << ",\"txEwm\":" << dtc->ReadTXEventWindowMarkerCount(link)
+		       << ",\"txDataRequest\":" << dtc->ReadTXDataRequestPacketCount(link)
+		       << ",\"txHeartbeat\":" << dtc->ReadTXHeartbeatPacketCount(link)
+		       << ",\"rxDataHeader\":" << dtc->ReadRXDataHeaderPacketCount(link) << "}";
+	}
+	values << "]}";
+	// Publish only a complete response; register-read exceptions propagate.
+	__SET_ARG_OUT__("Counter Values", values.str());
+}  // end GetDTCCounterValues()
+
+//========================================================================
 void ROCTrackerInterface::ResetCounters(__ARGS__)
 {
 	int rv = _roc->Reset();
@@ -1551,6 +1601,14 @@ std::string ROCTrackerInterface::FormatRatesTable(
 		    " {:4d} {:11.3f} {:11.3f} {:11.3f}\n", channel, cal, hiv, coi);
 	}
 	return table.str();
+}
+
+void ROCTrackerInterface::PublishRateSummary(__ARGS__)
+{
+	const auto summary = __GET_ARG_IN__("Summary JSON", std::string, "");
+	const auto lines   = tracker_rates::graphiteLines(summary, std::time(nullptr));
+	tracker_rates::sendGraphite(lines);
+	__SET_ARG_OUT__("Published", "1");
 }
 
 void ROCTrackerInterface::MeasureChannelRates(__ARGS__)

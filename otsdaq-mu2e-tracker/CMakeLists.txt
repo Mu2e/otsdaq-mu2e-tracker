@@ -1,4 +1,5 @@
 add_subdirectory(FEInterfaces)
+add_subdirectory(IteratorPlugins)
 # add_subdirectory(ArtModules)
 add_subdirectory(Generators)
 # add_subdirectory(Nt)
