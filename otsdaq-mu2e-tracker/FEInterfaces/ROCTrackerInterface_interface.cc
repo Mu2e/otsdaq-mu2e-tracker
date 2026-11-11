@@ -101,17 +101,35 @@ ROCTrackerInterface::ROCTrackerInterface(
 	    "" /* tooltip info here */);
 
 	registerFEMacroFunction(
+	    "Prepare external pulser run (tracker configuration)",
+	    static_cast<FEVInterface::frontEndMacroFunction_t>(
+	        &ROCTrackerInterface::PrepareExternalPulserRunConfigured),
+	    {"Modulo8 channel"}, {"Summary"}, 1,
+	    "Read ExternalPulserDelayCounts (-d) and ExternalPulserWidthCounts (-y) "
+	    "from the configured SubsystemTrackerGlobalParametersTable. Both must "
+	    "be enabled valid integer counts. No hardware write until Start.");
+	registerFEMacroFunction(
+	    "Cancel external pulser run",
+	    static_cast<FEVInterface::frontEndMacroFunction_t>(
+	        &ROCTrackerInterface::CancelExternalPulserRun),
+	    {}, {"Summary"}, 1,
+	    "Cancel a prepared external-pulser step and disable any scan-owned pulsing. "
+	    "Does not change masks, thresholds, or legacy manually enabled pulsing.");
+
+	registerFEMacroFunction(
 	    "Enable charge injection",
 	    static_cast<FEVInterface::frontEndMacroFunction_t>(
 	        &ROCTrackerInterface::EnableChargeInjection),
-	    std::vector<std::string>{"First channel mask", "Duty cycle", "Delay"},
+	    std::vector<std::string>{"First channel mask"},
 	    std::vector<std::string>{"Success"},
 	    1,
-	    "" /* tooltip info here */);
+	    "Enable the selected channel mask using only ExternalPulserDelayCounts and "
+	    "ExternalPulserWidthCounts from the configured tracker global table. "
+	    "Missing, disabled or invalid counts fail before any hardware write.");
 
 	registerFEMacroFunction("Disable charge injection",
 	                        static_cast<FEVInterface::frontEndMacroFunction_t>(
-	                            &ROCTrackerInterface::EnableChargeInjection),
+	                            &ROCTrackerInterface::DisableChargeInjection),
 	                        std::vector<std::string>{},
 	                        std::vector<std::string>{"Success"},
 	                        1,
@@ -467,6 +485,17 @@ std::string ROCTrackerInterface::getFirmwareVersion(void)
 
 void ROCTrackerInterface::InitReadout(__ARGS__)
 {
+	const auto result = initializeReadoutFromConfiguration();
+	__SET_ARG_OUT__("Readout Mode", std::to_string(result.readoutMode));
+	__SET_ARG_OUT__("DTC ID", std::to_string(result.dtcId));
+	__SET_ARG_OUT__("Return Code", std::to_string(result.returnCode));
+	__SET_ARG_OUT__("Summary", result.summary);
+	requireReadoutInitialization(result);
+}
+
+ROCTrackerInterface::ReadoutInitialization
+ROCTrackerInterface::initializeReadoutFromConfiguration()
+{
 	static const std::string trackerGlobalTable =
 	    "/SubsystemTrackerGlobalParametersTable";
 	static const std::array<std::string, 11> requiredParameters = {"ROCReadoutMode",
@@ -649,17 +678,19 @@ void ROCTrackerInterface::InitReadout(__ARGS__)
 	                                 eventWindowDelay5ns,
 	                                 readSettings,
 	                                 summary);
-	__SET_ARG_OUT__("Readout Mode", std::to_string(rocReadoutMode));
-	__SET_ARG_OUT__("DTC ID", std::to_string(dtcId));
-	__SET_ARG_OUT__("Return Code", std::to_string(rc));
-	__SET_ARG_OUT__("Summary", summary.str());
-	if(rc != 0)
+	return {rocReadoutMode, dtcId, rc, summary.str()};
+}
+
+void ROCTrackerInterface::requireReadoutInitialization(
+    const ReadoutInitialization& result) const
+{
+	if(result.returnCode != 0)
 		throw std::runtime_error(std::format(
 		    "Init Readout failed for ROC '{}' link {} with return code {}.\n{}",
 		    getInterfaceUID(),
 		    static_cast<unsigned int>(linkID_),
-		    rc,
-		    summary.str()));
+		    result.returnCode,
+		    result.summary));
 }
 
 void ROCTrackerInterface::ReadRegister(__ARGS__)
@@ -753,18 +784,77 @@ void ROCTrackerInterface::MeasureThreshold(__ARGS__)
 	__SET_ARG_OUT__("Total", std::to_string(rvt));
 }
 
+void ROCTrackerInterface::PrepareExternalPulserRunConfigured(__ARGS__)
+{
+	const int channel = __GET_ARG_IN__("Modulo8 channel", int, -1);
+	externalPulserRun_.prepare(configuredExternalPulserSettings(channel));
+	__SET_ARG_OUT__("Summary", "Source: SubsystemTrackerGlobalParametersTable; " + externalPulserRun_.summary());
+}
+
+tracker_external_pulser::Settings
+ROCTrackerInterface::configuredExternalPulserSettings(int channel)
+{
+	return tracker_external_pulser::configuredSettings(
+	    channel, [&](const std::string& name) {
+		const auto row = getConfigurationManager()->getNode(
+		    "/SubsystemTrackerGlobalParametersTable/" + name);
+		if(!row.getNode("Status").getValue<bool>())
+			throw std::runtime_error("External pulser: configured parameter " + name + " is disabled");
+		return row.getNode("ParameterValue").getValue<std::string>();
+	    });
+}
+
+void ROCTrackerInterface::CancelExternalPulserRun(__ARGS__)
+{
+	stopExternalPulserRun();
+	__SET_ARG_OUT__("Summary", "External pulser scan step cancelled; scan-owned pulsing disabled.");
+}
+
+void ROCTrackerInterface::startExternalPulserRun(bool initializeReadout)
+{
+	externalPulserRun_.start([&](const tracker_external_pulser::Settings& p) {
+		if(!_roc) throw std::runtime_error("External pulser: ROC is not ready");
+		if(initializeReadout)
+		{
+			const auto result = initializeReadoutFromConfiguration();
+			requireReadoutInitialization(result);
+			__FE_COUT__ << "External pulser InitReadout completed run="
+			            << externalPulserRunNumber_ << " ROC=" << getInterfaceUID()
+			            << " mode=" << result.readoutMode << " dtc_id=" << result.dtcId
+			            << __E__;
+		}
+		const int rc = _roc->EnableChargeInjection(p.mask, p.highTicks, p.period, 0, std::cout);
+		if(rc != 0) throw std::runtime_error("External pulser enable failed, rc=" + std::to_string(rc));
+	}, [&] {
+		if(!_roc) throw std::runtime_error("External pulser: ROC is not ready for cleanup");
+		const int rc = _roc->DisableChargeInjection(0, std::cout);
+		if(rc != 0) throw std::runtime_error("External pulser disable failed, rc=" + std::to_string(rc));
+	});
+	if(externalPulserRun_.active())
+		__FE_COUT__ << "External pulser run=" << externalPulserRunNumber_ << " "
+		            << externalPulserRun_.summary() << __E__;
+}
+
+void ROCTrackerInterface::stopExternalPulserRun(bool clearPrepared)
+{
+	externalPulserRun_.stop([&] {
+		if(!_roc) throw std::runtime_error("External pulser: ROC is not ready for cleanup");
+		const int rc = _roc->DisableChargeInjection(0, std::cout);
+		if(rc != 0) throw std::runtime_error("External pulser disable failed, rc=" + std::to_string(rc));
+	}, clearPrepared);
+}
+
 void ROCTrackerInterface::EnableChargeInjection(__ARGS__)
 {
 	int first_channel_mask = __GET_ARG_IN__("First channel mask", int, 0x10);
-	int duty_cycle         = __GET_ARG_IN__("Duty cycle", int, 10);
-	int delay              = __GET_ARG_IN__("Delay", int, 1000);
+	const auto pulse = configuredExternalPulserSettings(0);
 	int print_level        = 0;
 	trkdaq::NullStream null;
 	auto               stream = std::ostream(&null);
 
 	__FE_COUT__ << "ejc: ROCTrackerInterface::EnableChargeInjection" << __E__;
 	auto rv = _roc->EnableChargeInjection(
-	    first_channel_mask, duty_cycle, delay, print_level, stream);
+	    first_channel_mask, pulse.highTicks, pulse.period, print_level, stream);
 	__SET_ARG_OUT__("Success", std::to_string(rv));
 }
 
@@ -1691,9 +1781,10 @@ void ROCTrackerInterface::configure(void)
 	try
 	{
 		__CFG_COUT__
-		    << "Tracker configure, first configure back-end communication with DTC... "
+		    << "Tracker configure: reset DTC link-loss counter only... "
 		    << __E__;
-		ROCPolarFireCoreInterface::configure();
+		// Tracker Configure intentionally leaves the ROC delay untouched.
+		resetDTCLinkLossCounter();
 
 		//__COUT_INFO__ << "Tracker configure, next configure front-end... " << __E__;
 		//__COUT_INFO__ << "..... write parameter 1 = " << TrackerParameter_1_ << __E__;
@@ -1725,16 +1816,33 @@ void ROCTrackerInterface::configure(void)
 
 void ROCTrackerInterface::start(std::string runNumber)
 {
-	//	DataProducerBase::registerToBuffer();
-
-	return;
+	externalPulserRunNumber_ = runNumber;
+	startExternalPulserRun(true);
 }
 
 bool ROCTrackerInterface::running(void) { return true; }
 
-void ROCTrackerInterface::stop()  // runNumber)
+void ROCTrackerInterface::stop()
 {
-	return;
+	stopExternalPulserRun();
+}
+
+void ROCTrackerInterface::halt()
+{
+	ROCPolarFireCoreInterface::halt();
+	stopExternalPulserRun();
+}
+
+void ROCTrackerInterface::pause()
+{
+	stopExternalPulserRun(false);
+	ROCPolarFireCoreInterface::pause();
+}
+
+void ROCTrackerInterface::resume()
+{
+	ROCPolarFireCoreInterface::resume();
+	startExternalPulserRun();
 }
 
 // return false to stop workloop thread
