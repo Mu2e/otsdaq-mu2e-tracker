@@ -1,6 +1,7 @@
 #ifndef _ots_ROCTrackerInterface_h_
 #define _ots_ROCTrackerInterface_h_
 
+#include "otsdaq-mu2e-tracker/FEInterfaces/TrackerExternalPulser.h"
 #include <array>
 #include <fstream>
 #include <iostream>
@@ -69,6 +70,9 @@ public:
 	void SetThreshold(__ARGS__);
 	void MeasureThreshold(__ARGS__);
 
+	void PrepareExternalPulserRunConfigured(__ARGS__);
+	tracker_external_pulser::Settings configuredExternalPulserSettings(int channel);
+	void CancelExternalPulserRun(__ARGS__);
 	void EnableChargeInjection(__ARGS__);
 	void DisableChargeInjection(__ARGS__);
 
@@ -105,11 +109,19 @@ public:
 
 	void UpdateChannelThresholds(__ARGS__);
 
+	tracker_external_pulser::Run externalPulserRun_;
+	std::string externalPulserRunNumber_;
+	void startExternalPulserRun(bool initializeReadout = false);
+	void stopExternalPulserRun(bool clearPrepared = true);
+
 	// state machine
 	//----------------
 	void configure(void) override;
 	void start(std::string runNumber) override;
 	void stop(void) override;
+	void halt(void) override;
+	void pause(void) override;
+	void resume(void) override;
 	bool running(void) override;
 
 	// write and read to registers
@@ -176,6 +188,15 @@ protected:
 	};
 
 private:
+	struct ReadoutInitialization
+	{
+		uint32_t readoutMode;
+		uint32_t dtcId;
+		int returnCode;
+		std::string summary;
+	};
+	ReadoutInitialization initializeReadoutFromConfiguration();
+	void requireReadoutInitialization(const ReadoutInitialization& result) const;
   /**/
 
 	// format a per-channel threshold table from the flat 3*96 vector

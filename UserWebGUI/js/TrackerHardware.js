@@ -1669,10 +1669,16 @@ var Mu2eHardware = Mu2eHardware || {};
 	}
 
 	function _parseROCTargets(value) {
-		var targets = _tryParseNumericArray(value);
-		if (targets) return targets;
-		var scalar = Number(String(value === undefined ? "" : value).trim());
-		return isFinite(scalar) ? [scalar] : null;
+		// MacroMaker annotates scalar outputs, e.g. "4 (0x4)".
+		var text = String(value === undefined ? "" : value).trim();
+		var scalar = text.match(/^([0-5])(?:\s+\(0x([0-5])\))?$/i);
+		if (scalar) return scalar[2] === undefined || scalar[1] === scalar[2] ? [Number(scalar[1])] : null;
+		try {
+			var targets = JSON.parse(text);
+			return Array.isArray(targets) && targets.length && targets.every(function (n) {
+				return Number.isInteger(n) && n >= 0 && n <= 5;
+			}) ? targets : null;
+		} catch (e) { return null; }
 	}
 
 	// ROC/utils.c channel_map at c2d8bf5: raw DIGI index -> logical channel.
@@ -1777,7 +1783,7 @@ var Mu2eHardware = Mu2eHardware || {};
 			for (var channel = 0; channel < 96; ++channel) {
 				var rate = tables[0][channel];
 				var excluded = byROC[deviceUID] && byROC[deviceUID][channel];
-				html += "<tr><td class='settings-name'>" + channel + "</td>" +
+				html += "<tr><td class='settings-name" + (excluded === true ? " rate-masked" : "") + "'>" + channel + "</td>" +
 					_rateCellHTML(rate.hv, excluded) +
 					_rateCellHTML(rate.cal, excluded) +
 					_rateCellHTML(rate.total, excluded) + "</tr>";
@@ -2040,7 +2046,9 @@ var Mu2eHardware = Mu2eHardware || {};
 				if (panelIDTable) specializedHTML = panelIDTable;
 			}
 			if (!specializedHTML &&
-				macroName === "ROC FEMacro - Measure Channel Rates") {
+				(macroName === "ROC FEMacro - Measure Channel Rates" ||
+				 macroName === "Measure Channel Rates" ||
+				 /^Link[0-5]_.+_Measure Channel Rates$/.test(macroName))) {
 				var ratesTable = Mu2eHardware.formatChannelRatesTable(
 					t.outputs, deviceUID);
 				if (ratesTable) specializedHTML = ratesTable;
