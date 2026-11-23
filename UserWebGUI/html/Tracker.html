@@ -31,8 +31,6 @@
 		.tracker-counter-note { margin: 3px 0; }
 		.settings-table td.settings-value.rate-masked { background: #e0e0e0; color: #666; }
 		.settings-table td.settings-value.rate-high { background: #ffd6d6; color: #a40000; font-weight: bold; }
-		.tracker-roc-controls { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-		.tracker-led-button { font-size: 8px; padding: 3px 2px; }
 		.tracker-led-button:disabled { opacity: 0.5; cursor: default; }
 	</style>
 
@@ -349,10 +347,6 @@
 					for (var r = 0; r < dtc.rocs.length; ++r) {
 						var roc = dtc.rocs[r];
 						var rocEnabled = dtc.enabled && roc.enabled === "1";
-						var turnLEDOff = _rocLEDLastCommand[roc.name] !== "off";
-						var ledAction = turnLEDOff ? "off" : "on";
-						var ledTarget = rocLEDTarget(roc.name, turnLEDOff);
-						html += "<div class='tracker-roc-controls'>";
 						html += "<button type='button' class='tracker-roc-button" +
 							(rocEnabled ? "" : " tracker-device-disabled") +
 							(_selectedUID === roc.name ? " tracker-device-selected" : "") +
@@ -361,12 +355,7 @@
 						html += "<span class='status-dot " +
 							(rocEnabled ? "status-on" : "status-off") + "'></span>";
 						html += "<span>ROC " + r + "</span></button>";
-						html += "<button type='button' class='tracker-roc-button tracker-led-button' " +
-							"aria-label='Turn KEY LED " + ledAction + " for " + escapeHTML(roc.name) + "' " +
-							"title='" + (turnLEDOff ? "Turn off the KEY LED on " :
-								"Restore normal KEY LED behavior on ") + escapeHTML(roc.name) + "' " +
-							(ledTarget && !_globalBusy ? "" : "disabled ") +
-							"onclick=\"toggleROCLED('" + escapeJS(roc.name) + "',event)\">LED " + ledAction + "</button></div>";
+
 					}
 					if (!dtc.rocs.length)
 						html += "<span class='placeholder-text'>No ROCs configured.</span>";
@@ -438,6 +427,7 @@
 				if (success) _rocLEDLastCommand[uid] = ledAction;
 				finishDTCCommand(target.dtcUID, success, true);
 				setGlobalDisabled(false);
+				if (_selectedUID) renderSelection(_selectedUID);
 				updateOutputEntry(entryId, "<div class='" + (success ? "goodValue" : "badValue") + "'>" +
 					"KEY LED " + ledAction + (success ? " command sent to " : " command failed or was not confirmed for ") +
 					escapeHTML(uid) + ".</div>" +
@@ -519,6 +509,17 @@
 					"onclick=\"prepareMacro('" + escapeJS(name) + "')\">" +
 					escapeHTML(Mu2eHardware.macroDisplayName(name)) + "</button>";
 			}
+			if (deviceType === "roc") {
+				var turnLEDOff = _rocLEDLastCommand[uid] !== "off";
+				var ledAction = turnLEDOff ? "off" : "on";
+				var ledTarget = rocLEDTarget(uid, turnLEDOff);
+				html += "<button type='button' class='macro-btn-primary tracker-led-button' " +
+					"aria-label='Turn KEY LED " + ledAction + " for " + escapeHTML(uid) + "' " +
+					"title='" + (turnLEDOff ? "Turn off the KEY LED on " :
+						"Restore normal KEY LED behavior on ") + escapeHTML(uid) + "' " +
+					(ledTarget && !_globalBusy ? "" : "disabled ") +
+					"onclick=\"toggleROCLED('" + escapeJS(uid) + "',event)\">LED " + ledAction + "</button>";
+			}
 			html += actionGroupToggleButton(actionGroupKey, available.length);
 			html += "</div><div id='selectionInputs' class='tracker-selection-inputs'></div>";
 			panel.innerHTML = html;
@@ -534,6 +535,9 @@
 				if (/target\s+roc|roc.*(?:target|mask)/i.test(inputName))
 					inputs[inputName] = _macroRunTarget.linkIndex >= 0 ?
 						String(_macroRunTarget.linkIndex) : "-1";
+				else if (macroName === "ROC Read" &&
+					inputName === "Fail on Exception (Default := true)")
+					inputs[inputName] = "1";
 				else if (macroName === "ROC FEMacro - Deserialize and set thresholds" &&
 					/validate\s+only/i.test(inputName))
 					inputs[inputName] = "0";
