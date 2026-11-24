@@ -169,7 +169,13 @@
         return targets;
     };
     function numberList(s) {
-        const p = JSON.parse(String(s));
+        // MacroMaker appends a hex annotation to scalar numeric outputs.
+        // Validate it before removing it; arrays remain ordinary JSON.
+        const text = String(s).replace(/(-?\d+)\s*\(0x([0-9a-f]+)\)/gi, (match, decimal, hex) => {
+            requireOK(Number(decimal) === Number("0x" + hex), "Inconsistent numeric output annotation.");
+            return decimal;
+        });
+        const p = JSON.parse(text);
         const a = Array.isArray(p) ? p : [p];
         requireOK(a.length && a.every(Number.isInteger), "Malformed ROC/return-code list.");
         return a;
@@ -544,8 +550,11 @@
         };
         deps.measure = target => new Promise((resolve, reject) => {
             const m = Mu2eHardware.getMacrosForDevice(target.uid)[MACRO];
-            const mask = target.rocs.reduce((n, r) => n + (1 << (4 * r.link)), 0);
-            Mu2eHardware.runMacro(target.uid, MACRO, {[m.inputs[0]]: "0x" + mask.toString(16)}, resolve);
+            // Values 0..5 are link indices, not masks. In particular 0x1
+            // selects ROC1, so use a scalar index for every single-ROC target.
+            const selector = target.rocs.length === 1 ? String(target.rocs[0].link) :
+                "0x" + target.rocs.reduce((n, r) => n + (1 << (4 * r.link)), 0).toString(16);
+            Mu2eHardware.runMacro(target.uid, MACRO, {[m.inputs[0]]: selector}, resolve);
             // No command retry/timeout: an in-flight hardware macro must finish restoration.
         });
         function comment(report) { return "Tracker rate threshold " + report.threshold_khz + " kHz; " + report.started_at +

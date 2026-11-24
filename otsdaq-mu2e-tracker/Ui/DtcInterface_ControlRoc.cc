@@ -3,6 +3,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 #include <vector>
+#include <chrono>
+#include <stdexcept>
 #include "otsdaq-mu2e-tracker/Ui/DtcInterface.hh"
 
 #include "TRACE/tracemf.h"
@@ -377,7 +379,12 @@ namespace  trkdaq {
 //-----------------------------------------------------------------------------
   int DtcInterface::ControlRoc_PulserOn(int Link, int FirstChannelMask, int DutyCycle, int PulserDelay,
                                         int PrintLevel, std::ostream& Stream) {
-    int rc (0); //, reg(268);
+    int rc (0);
+    if(Link < -1 || Link > 5 || FirstChannelMask < 1 || FirstChannelMask > 255 ||
+       DutyCycle < 1 || DutyCycle > 65535 || PulserDelay < 1 || DutyCycle > PulserDelay)
+      throw std::runtime_error("Invalid external pulser parameters");
+    if(Link >= 0 && !LinkEnabled(Link))
+      throw std::runtime_error("External pulser target ROC link is disabled");
     TLOG(TLVL_DEBUG+1) << " -- START: Link:" << Link << " FirstChannelMask:0x" << std::hex << FirstChannelMask
                      << std::dec << " DutyCycle:" << DutyCycle << " PulserDelay:" << PulserDelay;
 
@@ -415,13 +422,17 @@ namespace  trkdaq {
         std::this_thread::sleep_for(std::chrono::microseconds(fSleepTimeROCWrite));
       }
       catch(...) {
-        TLOG(TLVL_ERROR) << "failed WriteROCBlock, continue" << std::endl;
-        continue;
+        throw std::runtime_error("External pulser block write failed on link " + std::to_string(i));
       }
 
                                         // 0x86 = 0x82 + 4
       uint16_t u;
-      while ((u = fDtc->ReadROCRegister(roc,128,100)) != 0x8000) {};
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while ((u = fDtc->ReadROCRegister(roc,128,100)) != 0x8000) {
+        if(std::chrono::steady_clock::now() >= deadline)
+          throw std::runtime_error("External pulser enable completion timeout on link " + std::to_string(i));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
       TLOG(TLVL_DEBUG+1) << Form("reg:%03i val:0x%04x\n",128,u);
 //-----------------------------------------------------------------------------
 // register 129: number of words to read, currently-  (+ 4) (ask Monica)
@@ -433,6 +444,8 @@ namespace  trkdaq {
       if (nw == 4) {
         std::vector<uint16_t> v2;
         fDtc->ReadROCBlock(v2,roc,REG_PULSERON,nw,false,100);
+        if(v2 != vec)
+          throw std::runtime_error("External pulser parameter echo mismatch on link " + std::to_string(i));
 
         if (PrintLevel & 0x1) {
           PrintBuffer(v2.data(),nw,0x0,Stream);
@@ -452,38 +465,45 @@ namespace  trkdaq {
 // Link=-1: all enabled links
 //-----------------------------------------------------------------------------
   int DtcInterface::ControlRoc_PulserOff(int Link, int PrintLevel, std::ostream& Stream) {
-    int rc(0);
-    TLOG(TLVL_DEBUG+1) << "-- START:" << __func__;
-    int l1(Link), l2(Link+1);
-    if (Link == -1) {
-      l1 = 0;
-      l2 = 6;
-    }
-
-    for (int i=l1; i<l2; i++) {
-      if (not LinkEnabled(i)) continue;
-//-----------------------------------------------------------------------------
-// PULSER_OFF: reg 269
-//-----------------------------------------------------------------------------
-      std::vector<uint16_t> res;
-      int rc = RocBlockRead(i,REG_PULSEROFF,res);
-
-      if (rc == 0) {
-        int nw = res.size();
-        TLOG(TLVL_DEBUG+1) << "link:" << i << " nw:" << nw;
-
-        if (PrintLevel & 0x1) {
-          PrintBuffer(res.data(),nw,0x0,Stream);
+    // PULSEROFF is a scalar command: firmware disables PWM and updates status
+    // without constructing a block reply (ROC/main.c case PULSEROFF).
+    if(Link < -1 || Link > 5) throw std::runtime_error("Invalid pulser-off ROC link");
+    if(Link >= 0 && !LinkEnabled(Link))
+      throw std::runtime_error("External pulser cleanup target ROC link is disabled");
+    for(int i = Link < 0 ? 0 : Link; i < (Link < 0 ? 6 : Link + 1); ++i) {
+      if(!LinkEnabled(i)) continue;
+      const auto roc = DTC_Link_ID(i);
+      fDtc->WriteROCRegister(roc, REG_PULSEROFF, 0, false, 100);
+      std::this_thread::sleep_for(std::chrono::microseconds(fSleepTimeROCWrite));
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      unsigned readErrors = 0;
+      constexpr unsigned maxReadErrors = 4; // Initial failure plus three retries.
+      for(;;) {
+        uint16_t status;
+        try {
+          status = fDtc->ReadROCRegister(roc, 128, 100);
         }
+        catch(const std::exception& error) {
+          ++readErrors;
+          if(readErrors >= maxReadErrors || std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("External pulser disable R128 read failed on link " +
+                                     std::to_string(i) + " after " + std::to_string(readErrors) +
+                                     " read error(s): " + error.what());
+          Stream << "External pulser R128 read error on link " << i
+                 << "; retrying (" << readErrors << "/" << maxReadErrors
+                 << " read errors): " << error.what() << std::endl;
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          continue;
+        }
+        if(status == 0x8000) break;
+        if(std::chrono::steady_clock::now() >= deadline)
+          throw std::runtime_error("External pulser disable completion timeout on link " + std::to_string(i));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-      else {
-        Stream << "ERROR:" << rc << " blockread link:" << i << " register:" << REG_PULSEROFF << std::endl;
-      }
+      Stream << "External pulser disabled on link " << i << std::endl;
     }
-    TLOG(TLVL_DEBUG+1) << " -- END " << __func__ << " rc:" << rc;
-    return rc;
+    return 0;
   }
-
 
 //-----------------------------------------------------------------------------
   int DtcInterface::ControlRoc_ReadSettings(int Link, int Channel, std::vector<uint16_t>& Settings,
