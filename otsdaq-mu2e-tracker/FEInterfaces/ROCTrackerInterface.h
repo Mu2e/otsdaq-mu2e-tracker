@@ -1,7 +1,6 @@
 #ifndef _ots_ROCTrackerInterface_h_
 #define _ots_ROCTrackerInterface_h_
 
-#include "otsdaq-mu2e-tracker/FEInterfaces/TrackerExternalPulser.h"
 #include <array>
 #include <fstream>
 #include <iostream>
@@ -9,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "otsdaq-mu2e-tracker/FEInterfaces/TrackerExternalPulser.h"
 
 #include "otsdaq-mu2e/FEInterfaces/ROCPolarFireCoreInterface.h"
 #include "otsdaq/DataManager/DataProducer.h"
